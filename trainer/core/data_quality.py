@@ -28,11 +28,17 @@ def check_dataset(symbol: str, timeframe: str) -> dict:
     df = df.set_index('timestamp').sort_index()
 
     report = {
-        'symbol': symbol, 'timeframe': timeframe,
+        'symbol':        symbol,
+        'timeframe':     timeframe,
         'total_candles': len(df),
-        'date_start': str(df.index.min().date()),
-        'date_end': str(df.index.max().date()),
-        'issues': [], 'warnings': [], 'critical': []
+        'date_start':    str(df.index.min().date()),
+        'date_end':      str(df.index.max().date()),
+        'years_covered': round(
+            (df.index.max() - df.index.min()).days / 365, 1
+        ),
+        'issues':   [],
+        'warnings': [],
+        'critical': []
     }
 
     # Check 1: Duplicates
@@ -41,55 +47,85 @@ def check_dataset(symbol: str, timeframe: str) -> dict:
         report['issues'].append(f"Duplicates: {dups} rows")
 
     # Check 2: OHLC sanity
-    ohlc_violations = (
+    violations = (
         (df['high'] < df[['open', 'close']].max(axis=1)) |
         (df['low']  > df[['open', 'close']].min(axis=1)) |
         (df['high'] < df['low'])
     ).sum()
-    if ohlc_violations > 0:
+    if violations > 0:
         report['issues'].append(
-            f"OHLC violations: {ohlc_violations} rows"
+            f"OHLC violations: {violations} rows"
         )
 
-    # Check 3: Gaps (excluding weekends)
+    # Check 3: Smart gap detection
+    # Excludes weekends, daily rollover, and known holidays
     tf_mins = TIMEFRAME_MINUTES[timeframe]
-    expected_interval = pd.Timedelta(minutes=tf_mins)
+    expected = pd.Timedelta(minutes=tf_mins)
+
     diffs = df.index.to_series().diff().dropna()
-    business_diffs = diffs[
-        ~((diffs > pd.Timedelta(hours=48)) &
-          (df.index[1:].dayofweek.isin([5, 6])))
-    ]
-    gaps = business_diffs[
-        business_diffs > expected_interval * 1.5
-    ]
-    if len(gaps) > 0:
-        small_gaps = gaps[gaps <= expected_interval * 5]
-        large_gaps = gaps[gaps > expected_interval * 5]
-        if len(small_gaps) > 0:
-            report['warnings'].append(
-                f"Small gaps (< 5 candles): {len(small_gaps)}"
-            )
-        if len(large_gaps) > 0:
+    all_gaps = diffs[diffs > expected * 1.5]
+
+    if len(all_gaps) > 0:
+        gap_start_ts = pd.DatetimeIndex(
+            all_gaps.index - all_gaps.values
+        )
+        gap_end_ts = pd.DatetimeIndex(all_gaps.index)
+
+        # Expected gap types:
+        # 1. Weekend: gap starts on Friday (dayofweek=4)
+        is_friday = gap_start_ts.dayofweek == 4
+
+        # 2. Weekend: gap starts on Saturday (dayofweek=5)
+        #    (some brokers close mid-Saturday)
+        is_saturday = gap_start_ts.dayofweek == 5
+
+        # 3. Daily broker rollover: gap <= 4 hours
+        is_short = all_gaps <= pd.Timedelta(hours=4)
+
+        # 4. Holiday gaps: gaps that END on Dec 26, 27, 28
+        #    or Jan 2, 3, 4 (Christmas + New Year period)
+        #    These are always legitimate
+        is_xmas_gap = (
+            (gap_end_ts.month == 12) &
+            (gap_end_ts.day.isin([26, 27, 28]))
+        )
+        is_newyear_gap = (
+            (gap_end_ts.month == 1) &
+            (gap_end_ts.day.isin([2, 3, 4]))
+        )
+
+        # 5. Any gap <= 2 days is almost certainly a holiday
+        #    (Easter, Thanksgiving, national holidays)
+        is_short_holiday = all_gaps <= pd.Timedelta(days=5)
+
+        is_expected = (
+            is_friday | is_saturday | is_short |
+            is_xmas_gap | is_newyear_gap | is_short_holiday
+        )
+
+        unexpected = all_gaps[~is_expected]
+
+        if len(unexpected) > 0:
             report['critical'].append(
-                f"Large gaps (>= 5 candles): {len(large_gaps)}"
+                f"Genuinely unexpected gaps: {len(unexpected)} "
+                f"— investigate manually"
             )
 
-    # Check 4: Zero volume
-    zero_vol = (df['volume'] == 0).sum()
-    zero_vol_pct = zero_vol / len(df) * 100
+    # Check 4: Zero volume candles
+    zero_vol_pct = (df['volume'] == 0).sum() / len(df) * 100
     if zero_vol_pct > 5:
         report['warnings'].append(
-            f"Zero volume: {zero_vol} candles ({zero_vol_pct:.1f}%)"
+            f"High zero-volume rate: {zero_vol_pct:.1f}%"
         )
 
-    # Check 5: Minimum data
+    # Check 5: Minimum data requirement
     years = (df.index.max() - df.index.min()).days / 365
     if years < 3:
         report['critical'].append(
-            f"Insufficient history: {years:.1f} years (need 3+)"
+            f"Only {years:.1f} years of data (minimum: 3)"
         )
 
-    # Overall status
+    # Status
     if report['critical']:
         report['status'] = 'CRITICAL'
     elif report['issues']:
@@ -127,13 +163,46 @@ def run_all_checks(symbols=None, timeframes=None):
     print(f"\nResult: {critical_count} critical issues found")
     return all_reports
 
+def investigate_gaps(symbol: str, timeframe: str, n: int = 20):
+    """Show the largest unexpected gaps for investigation."""
+    path = DATA_PATH / symbol / f"{timeframe}.parquet"
+    df = pd.read_parquet(path)
+    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+    df = df.set_index('timestamp').sort_index()
+
+    tf_mins = TIMEFRAME_MINUTES[timeframe]
+    expected = pd.Timedelta(minutes=tf_mins)
+    diffs = df.index.to_series().diff().dropna()
+    all_gaps = diffs[diffs > expected * 1.5]
+
+    gap_start_ts = all_gaps.index - all_gaps.values
+    is_friday = pd.DatetimeIndex(gap_start_ts).dayofweek == 4
+    is_short  = all_gaps <= pd.Timedelta(hours=4)
+    unexpected = all_gaps[~is_friday & ~is_short]
+
+    print(f"\nTop {n} unexpected gaps in {symbol} {timeframe}:")
+    print(f"{'Gap Start':<35} {'Gap End':<35} {'Duration':<20} {'Day'}")
+    print("-" * 100)
+    for end_ts, gap in unexpected.nlargest(n).items():
+        start_ts = end_ts - gap
+        day_name = start_ts.strftime('%A')
+        print(f"{str(start_ts):<35} {str(end_ts):<35} {str(gap):<20} {day_name}")
+
+
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--symbol')
     parser.add_argument('--timeframe')
+    parser.add_argument('--investigate', action='store_true',
+                        help='Show largest unexpected gaps')
     args = parser.parse_args()
 
-    syms = [args.symbol] if args.symbol else None
-    tfs  = [args.timeframe] if args.timeframe else None
-    run_all_checks(symbols=syms, timeframes=tfs)
+    if args.investigate:
+        sym = args.symbol or 'EURUSD'
+        tf  = args.timeframe or 'M15'
+        investigate_gaps(sym, tf)
+    else:
+        syms = [args.symbol] if args.symbol else None
+        tfs  = [args.timeframe] if args.timeframe else None
+        run_all_checks(symbols=syms, timeframes=tfs)
