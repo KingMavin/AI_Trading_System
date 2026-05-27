@@ -9,10 +9,10 @@ Commands:
 
 Usage:
   python trainer/trainer.py run
-  python trainer/trainer.py run --symbol EURUSD
-  python trainer/trainer.py run --quick
-  python trainer/trainer.py check
-  python trainer/trainer.py status
+  python -m trainer.trainer check
+  python -m trainer.trainer status
+  python -m trainer.trainer run --quick --symbol EURUSD
+  python -m trainer.trainer run --symbol EURUSD
 """
 
 import sys
