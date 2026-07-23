@@ -34,7 +34,7 @@ from trainer.core.backtester import Backtester
 from trainer.core.walk_forward import WalkForwardValidator
 from trainer.core.scoring import (
     check_hard_gates, calculate_composite_score,
-    aggregate_wf_results
+    aggregate_wf_results, calculate_quick_score
 )
 from trainer.core.knowledge_base import KnowledgeBase
 from shared.metrics import calculate_metrics
@@ -156,16 +156,7 @@ class ParameterSearch:
             )
             self.evaluations += 1
 
-            # Quick scoring — simplified for Stage 1
-            if metrics['total_trades'] < 20:
-                return 0.0
-            if metrics['profit_factor'] <= 1.0:
-                return 0.0
-
-            calmar = max(min(metrics['calmar_ratio'], 3.0), 0) / 3.0
-            pf     = max(min(metrics['profit_factor'], 3.0), 0) / 3.0
-            wr     = metrics['win_rate']
-            return calmar * 0.40 + pf * 0.35 + wr * 0.25
+            return calculate_quick_score(metrics, min_trades=20)
 
         except Exception as e:
             log.debug(f"Backtest error: {e}")
@@ -184,13 +175,14 @@ class ParameterSearch:
             f"on {self.symbol} | {len(grid)} combinations"
         )
 
+        from shared.instrument_spec import get_spec
+        spec = get_spec(self.symbol)
+        spec_pip_size = spec.pip_size if spec else (0.01 if self.symbol == 'USDJPY' else 0.0001)
+
         scored = []
         for i, params in enumerate(grid):
             params = params.copy()
-            params['pip_size'] = (
-                0.01 if self.symbol == 'USDJPY'
-                else 0.0001
-            )
+            params['pip_size'] = spec_pip_size
 
             # Compute config hash for deduplication
             candidate = CandidateConfig(
@@ -346,7 +338,9 @@ class ParameterSearch:
                         params.get('slow_ma_period', 1):
                     return 1.0  # maximally bad (skopt minimises)
 
-            params['pip_size']          = (
+            from shared.instrument_spec import get_spec
+            spec = get_spec(self.symbol)
+            params['pip_size']          = spec.pip_size if spec else (
                 0.01 if self.symbol == 'USDJPY' else 0.0001
             )
             params['risk_per_trade_pct']= 1.0
@@ -491,17 +485,7 @@ class FilterTesting:
                 result['equity_curve'],
                 self.initial_equity
             )
-            if metrics['total_trades'] < 10:
-                return 0.0
-            if metrics['profit_factor'] <= 1.0:
-                return 0.0
-            calmar = max(
-                min(metrics['calmar_ratio'], 3.0), 0
-            ) / 3.0
-            pf = max(
-                min(metrics['profit_factor'], 3.0), 0
-            ) / 3.0
-            return calmar * 0.50 + pf * 0.50
+            return calculate_quick_score(metrics, min_trades=10)
         except Exception:
             return 0.0
 
@@ -719,18 +703,7 @@ class CombinationTesting:
                 self.initial_equity
             )
 
-            if metrics['total_trades'] < 10:
-                return None
-
-            combo_score = 0.0
-            if metrics['profit_factor'] > 1.0:
-                calmar = max(
-                    min(metrics['calmar_ratio'], 3.0), 0
-                ) / 3.0
-                pf = max(
-                    min(metrics['profit_factor'], 3.0), 0
-                ) / 3.0
-                combo_score = calmar * 0.50 + pf * 0.50
+            combo_score = calculate_quick_score(metrics, min_trades=10)
 
             entry_score = entry_candidate.composite_score
             exit_score  = exit_candidate.composite_score
@@ -830,6 +803,20 @@ class AdaptationSystem:
         Run all adaptation stages.
         Returns list of best candidates ready for walk-forward.
         """
+        # Sanity gate — refuse before any candidate evaluation
+        from shared.instrument_spec import get_spec
+        _spec = get_spec(self.symbol)
+        if _spec is None:
+            raise ValueError(
+                f"AdaptationSystem({self.symbol}): No InstrumentSpec found. "
+                f"Run capture_specs.py with MT5 connected before adaptation."
+            )
+        if not _spec.sanity_ok:
+            raise ValueError(
+                f"AdaptationSystem({self.symbol}): InstrumentSpec flagged "
+                f"(sanity_ok=False). Re-capture during market hours."
+            )
+
         all_candidates         = []
         candidates_by_template = {}
 

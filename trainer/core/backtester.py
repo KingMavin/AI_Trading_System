@@ -15,6 +15,7 @@ import pandas as pd
 import numpy as np
 from typing import Dict, List, Any, Optional
 import importlib
+from datetime import datetime
 
 from shared.indicators import (
     calculate_sma, calculate_ema, calculate_rsi,
@@ -23,39 +24,8 @@ from shared.indicators import (
 )
 
 
-# ── SYMBOL SPECIFICATIONS ──────────────────────────────
-SYMBOL_SPECS = {
-    'EURUSD': {
-        'pip_size':           0.0001,
-        'lot_step':           0.01,
-        'lot_min':            0.01,
-        'lot_max':            100.0,
-        'stops_level_pips':   1.0,
-        'typical_spread':     1.0,    # pips
-        'typical_slippage':   0.3,    # pips
-        'commission_per_lot': 7.0,    # USD round trip
-    },
-    'GBPUSD': {
-        'pip_size':           0.0001,
-        'lot_step':           0.01,
-        'lot_min':            0.01,
-        'lot_max':            100.0,
-        'stops_level_pips':   1.0,
-        'typical_spread':     1.2,
-        'typical_slippage':   0.4,
-        'commission_per_lot': 7.0,
-    },
-    'USDJPY': {
-        'pip_size':           0.01,
-        'lot_step':           0.01,
-        'lot_min':            0.01,
-        'lot_max':            100.0,
-        'stops_level_pips':   1.0,
-        'typical_spread':     0.9,
-        'typical_slippage':   0.3,
-        'commission_per_lot': 7.0,
-    },
-}
+import logging
+log = logging.getLogger(__name__)
 
 # Session multipliers for spread model
 SESSION_SPREAD_MULT = {
@@ -87,12 +57,29 @@ class Backtester:
                  symbol: str,
                  params: Dict,
                  initial_equity: float = 10000.0,
-                 random_seed: int = 42):
+                 random_seed: int = 42,
+                 allow_simulation_defaults: bool = False):
         self.symbol         = symbol
         self.params         = params
         self.initial_equity = initial_equity
-        self.specs          = SYMBOL_SPECS[symbol]
-        self.pip_size       = self.specs['pip_size']
+        
+        from shared.instrument_spec import get_spec, InstrumentSpec
+        self.instrument_spec = get_spec(symbol)
+        
+        if self.instrument_spec is None:
+            if not allow_simulation_defaults:
+                raise ValueError(f"{symbol}: No captured InstrumentSpec found and allow_simulation_defaults=False.")
+            log.warning(
+                f"{symbol}: no captured InstrumentSpec found. "
+                f"Falling back to SIMULATION_DEFAULT. "
+                f"Any generated score/report must be tagged spec_source: 'SIMULATION_DEFAULT'."
+            )
+            self.instrument_spec = InstrumentSpec.build_simulation_default(symbol)
+            
+        if not self.instrument_spec.sanity_ok and not allow_simulation_defaults:
+            raise ValueError(f"{symbol}: InstrumentSpec sanity_ok is False. Refusing to backtest.")
+
+        self.pip_size       = self.instrument_spec.pip_size
         self.rng            = np.random.default_rng(random_seed)
 
         # Account state
@@ -237,7 +224,10 @@ class Backtester:
 
     def _simulated_spread(self, cache: Dict) -> float:
         """Dynamic spread based on session and volatility."""
-        base     = self.specs['typical_spread']
+        # Convert typical spread in points to pips
+        point_value = self.instrument_spec.spread_typical * self.instrument_spec.point
+        base = self.instrument_spec.price_to_pips(point_value) if self.instrument_spec.pip_size > 0 else 1.0
+        
         sess_m   = SESSION_SPREAD_MULT.get(
             cache['session'], 1.0
         )
@@ -249,7 +239,7 @@ class Backtester:
 
     def _simulated_slippage(self, cache: Dict) -> float:
         """Dynamic slippage based on volatility."""
-        base  = self.specs['typical_slippage']
+        base  = 0.3  # typical slippage in pips
         vol_m = _vol_mult(cache.get('atr_ratio', 1.0) or 1.0)
         noise = self.rng.uniform(0.85, 1.15)
         return base * vol_m * noise
@@ -257,27 +247,9 @@ class Backtester:
     def _calculate_lot_size(self, sl_price: float,
                              entry_price: float) -> float:
         """Calculate position size based on risk percentage."""
-        risk_pct    = self.params.get('risk_per_trade_pct', 1.0)
-        risk_amount = self.balance * (risk_pct / 100)
-
-        sl_distance = abs(entry_price - sl_price)
-        sl_pips     = sl_distance / self.pip_size
-
-        # Pip value: $10 per pip per lot for USD pairs
-        pip_value_per_lot = 10.0  # approximate for major pairs
-
-        if sl_pips <= 0:
-            return self.specs['lot_min']
-
-        raw_lots = risk_amount / (sl_pips * pip_value_per_lot)
-
-        # Round down to lot step
-        step      = self.specs['lot_step']
-        adj_lots  = int(raw_lots / step) * step
-        adj_lots  = max(adj_lots, self.specs['lot_min'])
-        adj_lots  = min(adj_lots, self.specs['lot_max'])
-
-        return round(adj_lots, 2)
+        risk_pct = self.params.get('risk_per_trade_pct', 1.0)
+        distance = abs(entry_price - sl_price)
+        return self.instrument_spec.lot_size_for_risk(self.balance, risk_pct, distance)
 
     def _open_position(self, signal: Dict,
                         candle_time,
@@ -298,7 +270,7 @@ class Backtester:
         tp_price = signal['tp_price']
 
         lots        = self._calculate_lot_size(sl_price, entry_price)
-        commission  = lots * self.specs['commission_per_lot'] / 2
+        commission  = lots * 7.0 / 2  # Hardcoded $7/lot RT
 
         self.balance -= commission
 
@@ -393,19 +365,21 @@ class Backtester:
         if pos is None:
             return
 
-        commission_close = (
-            pos['lots'] * self.specs['commission_per_lot'] / 2
+        commission_close = pos['lots'] * 7.0 / 2  # Hardcoded $7/lot RT
+        
+        ticks_won = (price - pos['entry_price']) / self.instrument_spec.tick_size
+        if pos['direction'] == 'SELL':
+            ticks_won = -ticks_won
+        gross_pnl = ticks_won * pos['lots'] * self.instrument_spec.tick_value
+
+        swap_cost = self._calculate_swap_cost(
+            direction=pos['direction'],
+            lots=pos['lots'],
+            entry_time=pos['entry_time'],
+            exit_time=candle_time
         )
 
-        if pos['direction'] == 'BUY':
-            gross_pnl = (price - pos['entry_price']) * \
-                        pos['lots'] * 100000
-        else:
-            gross_pnl = (pos['entry_price'] - price) * \
-                        pos['lots'] * 100000
-
-        net_pnl = gross_pnl - pos['commission_open'] \
-                  - commission_close
+        net_pnl = gross_pnl - pos['commission_open'] - commission_close + swap_cost
 
         self.balance    += net_pnl
         self.equity      = self.balance
@@ -420,9 +394,8 @@ class Backtester:
             'lots':           pos['lots'],
             'gross_pnl':      round(gross_pnl, 2),
             'net_pnl':        round(net_pnl, 2),
-            'commission':     round(
-                pos['commission_open'] + commission_close, 2
-            ),
+            'commission':     round(pos['commission_open'] + commission_close, 2),
+            'swap_cost':      round(swap_cost, 2),
             'close_reason':   reason,
             'duration_candles':pos['candles_open'],
             'entry_session':  pos['entry_session'],
@@ -437,9 +410,38 @@ class Backtester:
         if self.open_position is None:
             return 0.0
         pos = self.open_position
-        if pos['direction'] == 'BUY':
-            return (current_price - pos['entry_price']) * \
-                   pos['lots'] * 100000
-        else:
-            return (pos['entry_price'] - current_price) * \
-                   pos['lots'] * 100000
+        ticks_won = (current_price - pos['entry_price']) / self.instrument_spec.tick_size
+        if pos['direction'] == 'SELL':
+            ticks_won = -ticks_won
+        return ticks_won * pos['lots'] * self.instrument_spec.tick_value
+
+    def _calculate_swap_cost(self, direction: str, lots: float, entry_time: datetime, exit_time: datetime) -> float:
+        """
+        Calculate total swap cost between entry and exit.
+        Swap is applied at 21:00 UTC (Rollover).
+        Wednesday at 21:00 UTC charges 3x swap.
+        Saturday and Sunday at 21:00 UTC charge 0x swap.
+        """
+        if self.instrument_spec is None:
+            raise ValueError("InstrumentSpec is required for swap calculation")
+            
+        rate = self.instrument_spec.swap_long if direction == 'BUY' else self.instrument_spec.swap_short
+        total_cost = 0.0
+        
+        from datetime import timedelta
+        
+        curr_day = entry_time.replace(hour=21, minute=0, second=0, microsecond=0)
+        if curr_day <= entry_time:
+            curr_day += timedelta(days=1)
+            
+        while curr_day < exit_time:
+            weekday = curr_day.weekday()
+            if weekday == 2:  # Wednesday
+                total_cost += rate * lots * 3.0
+            elif weekday in (5, 6):  # Saturday, Sunday
+                pass # 0 swap
+            else:
+                total_cost += rate * lots * 1.0
+            curr_day += timedelta(days=1)
+            
+        return total_cost

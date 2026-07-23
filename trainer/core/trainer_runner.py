@@ -345,6 +345,21 @@ class TrainerRunner:
         decisions  = []
         candidates = []
 
+        from shared.instrument_spec import get_spec
+        spec = get_spec(symbol)
+        if spec is None:
+            raise ValueError(
+                f"Gate 1 (Structural) FAILED for {symbol}: "
+                f"No InstrumentSpec found. "
+                f"Run capture_specs.py with MT5 connected before training."
+            )
+        if not spec.sanity_ok:
+            raise ValueError(
+                f"Gate 1 (Structural) FAILED for {symbol}: "
+                f"InstrumentSpec flagged (sanity_ok=False). "
+                f"Re-capture during market hours before training."
+            )
+
         # ── Layer 2: Data Loading ──────────────────────
         record.layer_start('layer_2_data')
         try:

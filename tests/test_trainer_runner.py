@@ -205,3 +205,126 @@ class TestTrainerRunnerStructure:
         assert parts[0] == 'run'
         assert len(parts[1]) == 8   # YYYYMMDD
         assert len(parts[2]) == 6   # HHMMSS
+
+
+# ── SANITY_OK ENFORCEMENT TESTS ────────────────────────
+
+class TestSanityOkGates:
+    """
+    Verify that a sanity_ok=False InstrumentSpec hard-blocks
+    training at every boundary:
+      1. TrainerRunner._run_symbol (Gate 1)
+      2. WalkForwardValidator.__init__
+      3. AdaptationSystem.run
+    Each must raise ValueError — not log and silently continue.
+    """
+
+    def _make_flagged_spec(self, symbol: str):
+        """Return an InstrumentSpec with sanity_ok=False."""
+        from shared.instrument_spec import InstrumentSpec
+        return InstrumentSpec(
+            symbol=symbol, digits=5, point=1e-5,
+            contract_size=100000, tick_size=1e-5,
+            tick_value=0.858, volume_min=0.01,
+            volume_step=0.01, volume_max=500,
+            stops_level=0, spread_typical=1,
+            swap_long=-0.7, swap_short=-1.0,
+            currency_base="EUR", currency_profit="USD",
+            currency_margin="EUR", account_currency="EUR",
+            captured_at="2026-06-01T00:00:00+00:00",
+            sanity_ok=False,
+        )
+
+    def test_runner_run_symbol_raises_when_spec_missing(self, tmp_path):
+        """
+        _run_symbol must raise ValueError when no spec exists.
+        Root cause: Gate 1 in _run_symbol must hard-fail, not silently return.
+        """
+        import shared.instrument_spec as mod
+        original = mod.SPEC_CACHE_PATH
+        mod.SPEC_CACHE_PATH = tmp_path / "empty.json"
+
+        from trainer.core.trainer_runner import TrainerRunner, RunRecord
+        from trainer.core.knowledge_base import KnowledgeBase
+        runner = TrainerRunner()
+        record = RunRecord(runner.run_id, runner.config)
+        kb = KnowledgeBase()
+
+        with pytest.raises(ValueError, match="No InstrumentSpec found"):
+            runner._run_symbol("EURUSD", record, kb)
+
+        mod.SPEC_CACHE_PATH = original
+
+    def test_runner_run_symbol_raises_when_sanity_not_ok(self, tmp_path):
+        """
+        _run_symbol must raise ValueError when spec has sanity_ok=False.
+        Root cause: Gate 1 must hard-fail on flagged instruments.
+        """
+        from shared.instrument_spec import save_specs
+        import shared.instrument_spec as mod
+        original = mod.SPEC_CACHE_PATH
+        mod.SPEC_CACHE_PATH = tmp_path / "specs.json"
+
+        save_specs({"EURUSD": self._make_flagged_spec("EURUSD")})
+
+        from trainer.core.trainer_runner import TrainerRunner, RunRecord
+        from trainer.core.knowledge_base import KnowledgeBase
+        runner = TrainerRunner()
+        record = RunRecord(runner.run_id, runner.config)
+        kb = KnowledgeBase()
+
+        with pytest.raises(ValueError, match="sanity_ok=False"):
+            runner._run_symbol("EURUSD", record, kb)
+
+        mod.SPEC_CACHE_PATH = original
+
+    def test_walk_forward_validator_raises_when_sanity_not_ok(self, tmp_path):
+        """
+        WalkForwardValidator must raise at __init__ when spec is flagged.
+        Root cause: no WF window may begin for a flagged instrument.
+        """
+        import pandas as pd
+        from shared.instrument_spec import save_specs
+        import shared.instrument_spec as mod
+        original = mod.SPEC_CACHE_PATH
+        mod.SPEC_CACHE_PATH = tmp_path / "specs.json"
+
+        save_specs({"EURUSD": self._make_flagged_spec("EURUSD")})
+
+        from trainer.core.walk_forward import WalkForwardValidator
+        df = pd.DataFrame()  # empty; __init__ must raise before reading it
+
+        with pytest.raises(ValueError, match="sanity_ok=False"):
+            WalkForwardValidator(symbol="EURUSD", df=df)
+
+        mod.SPEC_CACHE_PATH = original
+
+    def test_adaptation_system_raises_when_sanity_not_ok(self, tmp_path):
+        """
+        AdaptationSystem.run must raise before any candidate evaluation
+        when the symbol's spec has sanity_ok=False.
+        """
+        import pandas as pd
+        from shared.instrument_spec import save_specs
+        import shared.instrument_spec as mod
+        original = mod.SPEC_CACHE_PATH
+        mod.SPEC_CACHE_PATH = tmp_path / "specs.json"
+
+        save_specs({"EURUSD": self._make_flagged_spec("EURUSD")})
+
+        from trainer.core.adaptation import AdaptationSystem
+        from trainer.core.knowledge_base import KnowledgeBase
+
+        system = AdaptationSystem(
+            symbol="EURUSD",
+            df=pd.DataFrame(),
+            df_held_out=pd.DataFrame(),
+            knowledge_base=KnowledgeBase(),
+            data_hash="test",
+            run_id="test_run",
+        )
+
+        with pytest.raises(ValueError, match="sanity_ok=False"):
+            system.run()
+
+        mod.SPEC_CACHE_PATH = original

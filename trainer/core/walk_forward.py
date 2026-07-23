@@ -139,6 +139,20 @@ class WalkForwardValidator:
         self.min_trades_opt = min_trades_opt
         self.min_trades_test= min_trades_test
 
+        # Sanity gate — refuse before any WF window starts
+        from shared.instrument_spec import get_spec
+        _spec = get_spec(symbol)
+        if _spec is None:
+            raise ValueError(
+                f"WalkForwardValidator({symbol}): No InstrumentSpec found. "
+                f"Run capture_specs.py with MT5 connected before walk-forward."
+            )
+        if not _spec.sanity_ok:
+            raise ValueError(
+                f"WalkForwardValidator({symbol}): InstrumentSpec flagged "
+                f"(sanity_ok=False). Re-capture during market hours."
+            )
+
         # All parameter combinations to test
         self.param_grid     = get_grid(template)
         log.info(
