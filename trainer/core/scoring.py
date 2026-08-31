@@ -23,7 +23,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import numpy as np
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 
 
@@ -37,6 +37,7 @@ GATES = {
     'min_profitable_window_rate':  0.55,
     'max_consecutive_losses':     10,
     'min_regime_windows':          3,
+    'max_monte_carlo_breach_rate': 3.0,
 }
 
 # ── SCORING WEIGHTS ────────────────────────────────────
@@ -96,17 +97,97 @@ class CompositeScore:
 
 # ── HARD GATE FILTER ───────────────────────────────────
 
-def check_hard_gates(wf_summary: Dict,
-                     candidate_id: str = 'unknown') -> GateResult:
+def run_monte_carlo_stress_test(
+    trades: List[Dict],
+    symbol: str = 'EURUSD',
+    mandate: Optional[object] = None,
+    initial_equity: float = 10000.0,
+    n_permutations: int = 500,
+    max_slippage_pips: float = 1.5,
+    seed: int = 42
+) -> Tuple[float, Optional[str]]:
     """
-    Run all 8 hard gates against a walk-forward summary.
+    Executes a vectorized Monte Carlo trade sequence permutation & slippage stress test.
+    Applies uniform additive slippage penalty s_i ~ Uniform(0.0, max_slippage_pips) in pips per trade.
+    Reuses evaluate_backtest_mandate() for every synthetic equity curve.
+
+    Returns:
+        (breach_rate_pct: float, worst_breach_reason: Optional[str])
+    """
+    if not trades:
+        return 100.0, "Zero out-of-sample trades available for Monte Carlo stress test"
+
+    from shared.instrument_spec import get_spec
+    from trainer.core.mandate_evaluator import evaluate_backtest_mandate
+
+    spec = get_spec(symbol)
+    if spec is None:
+        raise RuntimeError(
+            f"INSTRUMENT_SPEC_MISSING: Cannot run Monte Carlo stress test for {symbol} — "
+            "no cached InstrumentSpec. Run capture_specs.py with MT5 connected."
+        )
+    # Use the canonical pip_value property — never recompute tick_value*(pip_size/tick_size)
+    pip_value_per_lot = spec.pip_value
+
+    rng = np.random.default_rng(seed)
+    breach_count = 0
+    worst_reason = None
+    trade_count = len(trades)
+
+    for k in range(n_permutations):
+        # 1. Random shuffle permutation index
+        perm_indices = rng.permutation(trade_count)
+
+        # 2. Sample uniform slippage penalty in pips [0.0, max_slippage_pips]
+        slippage_pips = rng.uniform(0.0, max_slippage_pips, size=trade_count)
+
+        # 3. Construct synthetic equity curve.
+        # Anchor point at initial_equity ensures overall drawdown from the starting
+        # balance is correctly detected even if the first trade is a loss.
+        synthetic_curve = [{'timestamp': None, 'equity': initial_equity}]
+        current_eq = initial_equity
+
+        for i_idx, orig_idx in enumerate(perm_indices):
+            tr = trades[orig_idx]
+            lots = float(tr.get('lots', 1.0))
+            slippage_cost = float(slippage_pips[i_idx] * pip_value_per_lot * lots)
+            adjusted_pnl = float(tr.get('pnl', 0.0)) - slippage_cost
+
+            current_eq += adjusted_pnl
+            exit_time = tr.get('exit_time')
+            synthetic_curve.append({
+                'timestamp': exit_time,
+                'equity': current_eq
+            })
+
+        # 4. Evaluate mandate against synthetic equity curve using single-source-of-truth evaluator
+        is_compliant, reason = evaluate_backtest_mandate(synthetic_curve, mandate=mandate)
+        if not is_compliant:
+            breach_count += 1
+            if worst_reason is None:
+                worst_reason = reason
+
+    breach_rate = (breach_count / n_permutations) * 100.0
+    return breach_rate, worst_reason
+
+
+def check_hard_gates(wf_summary: Dict,
+                     candidate_id: str = 'unknown',
+                     mandate: Optional[object] = None,
+                     symbol: str = 'EURUSD',
+                     initial_equity: float = 10000.0) -> GateResult:
+    """
+    Run all 10 hard gates against a walk-forward summary.
 
     Args:
         wf_summary: aggregated walk-forward metrics dict
         candidate_id: identifier for logging
+        mandate: prop-firm mandate configuration
+        symbol: trading instrument symbol
+        initial_equity: starting equity
 
     Returns:
-        GateResult with passed=True if all gates pass
+        GateResult with passed=True if all 10 gates pass
     """
     details = {}
 
@@ -223,7 +304,68 @@ def check_hard_gates(wf_summary: Dict,
     details['gate_8_regime_coverage'] = regime_windows
     # Not a hard failure — flagged in composite score instead
 
-    # All hard gates passed
+    # Gate 9: Prop-Firm Mandate Compliance (Fix 11.2)
+    mandate_compliant = wf_summary.get('mandate_compliant', True)
+    breach_reason = wf_summary.get('mandate_breach_reason', 'Mandate compliance failure')
+    details['gate_9_mandate_compliant'] = mandate_compliant
+    if not mandate_compliant:
+        return GateResult(
+            candidate_id=candidate_id,
+            passed=False,
+            failed_gate='gate_9_mandate_compliance',
+            failure_reason=f"Mandate compliance breach: {breach_reason}",
+            gate_details=details
+        )
+
+    # Gate 10: Monte Carlo / Slippage Stress Gate (WAVE 14)
+    # all_oos_trades is collected by aggregate_wf_results() from real WindowResult.oos_trades_list
+    # data on every production run. When the key is absent (legacy or malformed summary dict) or
+    # the list is empty, the gate FAILS LOUDLY — no fabricated trades, ever.
+    all_oos_trades = wf_summary.get('all_oos_trades')
+    if all_oos_trades is None:
+        return GateResult(
+            candidate_id=candidate_id,
+            passed=False,
+            failed_gate='gate_10_monte_carlo_stress',
+            failure_reason=(
+                "GATE_10_DATA_MISSING: 'all_oos_trades' key absent from wf_summary. "
+                "This indicates the summary dict was not produced by aggregate_wf_results() "
+                "or WindowResult.oos_trades_list was not populated. Failing closed."
+            ),
+            gate_details=details
+        )
+    if len(all_oos_trades) == 0:
+        return GateResult(
+            candidate_id=candidate_id,
+            passed=False,
+            failed_gate='gate_10_monte_carlo_stress',
+            failure_reason="GATE_10_ZERO_TRADES: Zero out-of-sample trades available for Monte Carlo evaluation.",
+            gate_details=details
+        )
+
+    breach_rate, mc_reason = run_monte_carlo_stress_test(
+        trades=all_oos_trades,
+        symbol=symbol,
+        mandate=mandate,
+        initial_equity=initial_equity,
+        n_permutations=500,
+        max_slippage_pips=1.5
+    )
+    details['gate_10_monte_carlo_stress'] = breach_rate
+
+    if breach_rate > GATES['max_monte_carlo_breach_rate']:
+        return GateResult(
+            candidate_id=candidate_id,
+            passed=False,
+            failed_gate='gate_10_monte_carlo_stress',
+            failure_reason=(
+                f"Monte Carlo stress breach: {breach_rate:.1f}% of permutations breached mandate "
+                f"(ceiling {GATES['max_monte_carlo_breach_rate']}%) | Detail: {mc_reason}"
+            ),
+            gate_details=details
+        )
+
+    # All 10 hard gates passed
     return GateResult(
         candidate_id=candidate_id,
         passed=True,
@@ -336,6 +478,23 @@ def calculate_composite_score(wf_summary: Dict,
     return result
 
 
+def calculate_quick_score(metrics: Dict, min_trades: int = 10) -> float:
+    """
+    Calculate a fast, simplified score from a single backtest run.
+    Used for rapid candidate evaluation in adaptation stages.
+    """
+    if metrics.get('total_trades', 0) < min_trades:
+        return 0.0
+    if metrics.get('profit_factor', 0.0) <= 1.0:
+        return 0.0
+
+    calmar = max(min(metrics.get('calmar_ratio', 0.0), 3.0), 0) / 3.0
+    pf     = max(min(metrics.get('profit_factor', 0.0), 3.0), 0) / 3.0
+    
+    # 50% Calmar, 50% Profit Factor for rapid adaptation filtering
+    return calmar * 0.50 + pf * 0.50
+
+
 # ── AGGREGATE WALK-FORWARD RESULTS ─────────────────────
 
 def aggregate_wf_results(window_results: list) -> Dict:
@@ -428,11 +587,26 @@ def aggregate_wf_results(window_results: list) -> Dict:
         n = len(s)
         return s[n // 2] if n % 2 else (s[n//2-1] + s[n//2]) / 2
 
+    mandate_compliant = True
+    mandate_breach_reason = None
+    for r in valid:
+        if getattr(r, 'oos_mandate_compliant', True) is False:
+            mandate_compliant = False
+            mandate_breach_reason = getattr(r, 'oos_mandate_breach_reason', 'Window mandate breach')
+            break
+
+    all_oos_trades = []
+    for r in valid:
+        all_oos_trades.extend(getattr(r, 'oos_trades_list', []))
+
+    win_rate_list = [r.oos_win_rate for r in valid]
+
     return {
         'valid_windows':             len(valid),
         'total_trades':              total_trades,
         'median_trades_per_window':  median(trades_list),
         'median_profit_factor':      median(pf_list),
+        'median_win_rate':          median(win_rate_list),
         'median_calmar_ratio':       median(calmar_list),
         'median_avg_win_loss':       median(wl_list),
         'median_max_drawdown_pct':   median(dd_list),
@@ -443,6 +617,9 @@ def aggregate_wf_results(window_results: list) -> Dict:
         'temporal_trend_pct':        trend_pct,
         'total_oos_pnl':             sum(net_list),
         'avg_oos_pnl_per_window':    sum(net_list) / len(valid),
+        'mandate_compliant':         mandate_compliant,
+        'mandate_breach_reason':     mandate_breach_reason,
+        'all_oos_trades':            all_oos_trades,
     }
 
 

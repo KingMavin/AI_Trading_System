@@ -23,6 +23,7 @@ from typing import Dict, Optional, List
 from dataclasses import dataclass, field, asdict
 
 from trainer.core.scoring import CompositeScore, GateResult
+from shared.dna import compute_dna_hash
 
 
 # ── PROMOTION THRESHOLDS ───────────────────────────────
@@ -381,8 +382,13 @@ class PromotionEngine:
             active.rename(archived)
 
         # Write new strategy
+        params = wf_summary.get('best_params', {})
+        filters = {}
+        dna_hash = compute_dna_hash(params, filters)
+
         strategy = {
             'strategy_id':        decision.candidate_id,
+            'dna_hash':           dna_hash,
             'composite_score':    decision.composite_score,
             'promoted_at':        datetime.now(
                 timezone.utc
@@ -390,6 +396,8 @@ class PromotionEngine:
             'promoted_by':        'trainer_auto',
             'improvement_pct':    decision.improvement_pct,
             'baseline_strategy':  self.baseline['strategy_id'],
+            'parameters':         params,
+            'filters':            filters,
             'wf_summary':         wf_summary,
         }
 

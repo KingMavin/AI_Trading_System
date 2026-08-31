@@ -19,13 +19,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 import logging
 
 from trainer.core.backtester import Backtester
 from trainer.core.parameter_grid import get_grid
 from shared.metrics import calculate_metrics
+from shared.instrument_spec import get_spec
 import trainer.signals.ma_crossover as ma_crossover
 
 logging.basicConfig(
@@ -69,6 +70,13 @@ class WindowResult:
     status:              str   = 'OK'
     # OK / INSUFFICIENT_DATA / INSUFFICIENT_TRADES
 
+    # Prop-Firm Mandate Compliance (Fix 11.2)
+    oos_mandate_compliant:     bool = True
+    oos_mandate_breach_reason: Optional[str] = None
+
+    # Raw OOS trades for Monte Carlo stress testing (WAVE 14)
+    oos_trades_list:           List[Dict] = field(default_factory=list)
+
 
 def composite_score(metrics: Dict) -> float:
     """
@@ -82,9 +90,11 @@ def composite_score(metrics: Dict) -> float:
 
     Returns 0.0 if insufficient trades or losing strategy.
     """
-    if metrics['total_trades'] < 20:
+    if metrics.get('total_trades', 0) < 20:
         return 0.0
-    if metrics['profit_factor'] <= 1.0:
+    if metrics.get('profit_factor', 0.0) <= 1.0:
+        return 0.0
+    if metrics.get('mandate_compliant') is False:
         return 0.0
 
     calmar_norm = min(metrics['calmar_ratio'], 3.0) / 3.0
@@ -116,6 +126,7 @@ class WalkForwardValidator:
         initial_equity:   starting account equity
         min_trades_opt:   minimum trades required in opt window
         min_trades_test:  minimum trades required in test window
+        mandate:          optional mandate configuration
     """
 
     def __init__(self,
@@ -127,7 +138,8 @@ class WalkForwardValidator:
                  test_months:   int         = 1,
                  initial_equity:float       = 10000.0,
                  min_trades_opt:int         = 30,
-                 min_trades_test:int        = 10):
+                 min_trades_test:int        = 10,
+                 mandate                    = None):
 
         self.symbol         = symbol
         self.df             = df
@@ -138,6 +150,7 @@ class WalkForwardValidator:
         self.initial_equity = initial_equity
         self.min_trades_opt = min_trades_opt
         self.min_trades_test= min_trades_test
+        self.mandate        = mandate
 
         # Sanity gate — refuse before any WF window starts
         from shared.instrument_spec import get_spec
@@ -246,35 +259,103 @@ class WalkForwardValidator:
             equity_curve=result['equity_curve'],
             initial_equity=self.initial_equity
         )
+        from trainer.core.mandate_evaluator import evaluate_backtest_mandate
+        is_compliant, breach_reason = evaluate_backtest_mandate(result['equity_curve'], mandate=self.mandate)
+        metrics['mandate_compliant'] = is_compliant
+        metrics['mandate_breach_reason'] = breach_reason
+        metrics['trades'] = result['trades']
         return metrics
 
     def _optimise(self, df_opt: pd.DataFrame,
-                  window_num: int) -> tuple:
+                  window_num: int,
+                  n_trials: int = 50
+                  ) -> Tuple[Optional[Dict], float, Optional[Dict]]:
         """
-        Find the best parameter set on the optimisation window.
-        Tests every combination in the parameter grid.
-        Returns (best_params, best_score, best_metrics).
+        Find best parameters on training window.
+        When grid size <= n_trials, evaluates every parameter combination via GridSampler.
+        When grid size > n_trials, samples n_trials parameter indices via TPESampler.
+        Note: TPE over a single 1D param_idx integer domain acts as stochastic subsampling
+        of the discrete parameter grid rather than multi-dimensional parameter space modeling.
         """
+        from trainer.core.coherence_validator import validate_coherence
+        from shared.instrument_spec import get_spec
+
+        spec = get_spec(self.symbol)
+        if not spec or not spec.sanity_ok:
+            raise ValueError(f"INSTRUMENT_SPEC_MISSING: Missing or invalid InstrumentSpec for {self.symbol}")
+
+        if not self.param_grid:
+            return None, 0.0, None
+
+        try:
+            import optuna
+        except ImportError:
+            raise ImportError(
+                "OPTUNA_NOT_INSTALLED: Optuna package is required for Walk-Forward optimization. "
+                "Install via: pip install optuna"
+            )
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+
         best_score   = -1.0
         best_params  = None
         best_metrics = None
 
-        for i, params in enumerate(self.param_grid):
-            params['pip_size'] = (
-                0.01 if self.symbol == 'USDJPY' else 0.0001
-            )
-            metrics = self._run_one(
-                df_opt, params,
-                seed=window_num * 1000 + i
-            )
+        opt_seed = window_num * 1000 + 42
+        if len(self.param_grid) <= n_trials:
+            sampler = optuna.samplers.GridSampler({'param_idx': list(range(len(self.param_grid)))})
+            max_evals = len(self.param_grid)
+        else:
+            sampler = optuna.samplers.TPESampler(seed=opt_seed)
+            max_evals = n_trials
+
+        study = optuna.create_study(direction="maximize", sampler=sampler)
+
+        def objective(trial: optuna.Trial) -> float:
+            nonlocal best_score, best_params, best_metrics
+            param_idx = trial.suggest_int('param_idx', 0, len(self.param_grid) - 1)
+            params = self.param_grid[param_idx]
+
+            is_coherent, reason = validate_coherence(params, spec)
+            if not is_coherent:
+                return -1.0
+
+            params_eval = params.copy()
+            params_eval['pip_size'] = spec.pip_size
+
+            metrics = self._run_one(df_opt, params_eval, seed=opt_seed + trial.number)
             score = composite_score(metrics)
 
             if score > best_score:
                 best_score   = score
-                best_params  = params.copy()
+                best_params  = params_eval.copy()
                 best_metrics = metrics
 
+            return score
+
+        study.optimize(objective, n_trials=max_evals)
+
+        if best_params is None or best_score <= 0.0:
+            return None, 0.0, None
+
         return best_params, best_score, best_metrics
+
+    def _update_progress(self, current_window: int, total_windows: int) -> None:
+        """Update live progress metrics in trainer_status.json for dashboard."""
+        try:
+            status_file = Path(__file__).parent.parent / 'trainer_data' / 'trainer_status.json'
+            if status_file.exists():
+                with open(status_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                data['current_window'] = current_window
+                data['total_windows']   = total_windows
+                data['progress_pct']    = round((current_window / max(1, total_windows)) * 100, 1)
+                tmp_file = status_file.with_suffix('.tmp')
+                with open(tmp_file, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2)
+                tmp_file.replace(status_file)
+        except Exception:
+            pass  # Progress reporting is best-effort
 
     def run(self) -> List[WindowResult]:
         """
@@ -288,6 +369,7 @@ class WalkForwardValidator:
 
         for w in windows:
             wn = w['window_num']
+            self._update_progress(wn, len(windows))
             log.info(
                 f"Window {wn}/{len(windows)}: "
                 f"opt {w['opt_start'].date()} → "
@@ -339,19 +421,22 @@ class WalkForwardValidator:
             result.is_net_profit      = is_metrics['net_profit']
             result.is_composite_score = best_score
 
+            if self.template == 'rsi_reversion':
+                param_str = f"os={best_params.get('rsi_oversold')} ob={best_params.get('rsi_overbought')} midline={best_params.get('exit_on_midline')} sl={best_params.get('sl_atr_multiple')} tp={best_params.get('tp_rr_ratio')}"
+            else:
+                param_str = f"fast={best_params.get('fast_ma_period')} slow={best_params.get('slow_ma_period')} sl={best_params.get('sl_atr_multiple')} tp={best_params.get('tp_rr_ratio')}"
+
             log.info(
-                f"  IS best: fast={best_params['fast_ma_period']} "
-                f"slow={best_params['slow_ma_period']} "
-                f"sl={best_params['sl_atr_multiple']} "
-                f"tp={best_params['tp_rr_ratio']} | "
+                f"  IS best: {param_str} | "
                 f"score={best_score:.3f} "
                 f"trades={is_metrics['total_trades']}"
             )
 
             # Step 2: Test on unseen data
-            best_params['pip_size'] = (
-                0.01 if self.symbol == 'USDJPY' else 0.0001
-            )
+            spec = get_spec(self.symbol)
+            if not spec or not spec.sanity_ok:
+                raise ValueError(f"INSTRUMENT_SPEC_MISSING: Missing or invalid InstrumentSpec for {self.symbol}")
+            best_params['pip_size'] = spec.pip_size
             oos_metrics = self._run_one(
                 df_test, best_params,
                 seed=wn * 9999
@@ -364,6 +449,9 @@ class WalkForwardValidator:
             result.oos_win_rate        = oos_metrics['win_rate']
             result.oos_max_drawdown    = oos_metrics['max_drawdown_pct']
             result.oos_composite_score = composite_score(oos_metrics)
+            result.oos_mandate_compliant = oos_metrics.get('mandate_compliant', True)
+            result.oos_mandate_breach_reason = oos_metrics.get('mandate_breach_reason')
+            result.oos_trades_list = oos_metrics.get('trades', [])
 
             log.info(
                 f"  OOS: trades={oos_metrics['total_trades']} "

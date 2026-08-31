@@ -33,6 +33,7 @@ from trainer.core.scoring import (
 from trainer.core.promotion import PromotionEngine
 from trainer.core.knowledge_base import KnowledgeBase
 import trainer.signals.ma_crossover as ma_crossover
+import trainer.signals.rsi_reversion as rsi_reversion
 
 logging.basicConfig(
     level=logging.INFO,
@@ -92,6 +93,7 @@ class RunRecord:
         self.deployed_strategy_id = None
         self.failure_layer        = None
         self.failure_reason       = None
+        self.symbol_status: Dict[str, Dict] = {}
 
     def layer_start(self, layer: str) -> None:
         self.layers[layer] = {
@@ -170,12 +172,12 @@ def compute_data_hash(symbol: str, timeframe: str) -> str:
 
 def print_run_header(config: Dict, run_id: str) -> None:
     print(f"\n{'='*60}")
-    print(f"  ATS TRAINER — TRAINING RUN")
+    print(f"  ATS TRAINER - TRAINING RUN")
     print(f"{'='*60}")
     print(f"  Run ID:    {run_id}")
     print(f"  Symbols:   {', '.join(config['symbols'])}")
     print(f"  Templates: {', '.join(config['templates'])}")
-    print(f"  Period:    {config['data_start']} → "
+    print(f"  Period:    {config['data_start']} -> "
           f"{config['data_end']}")
     print(f"  OPT/TEST:  {config['opt_months']}m / "
           f"{config['test_months']}m windows")
@@ -230,25 +232,25 @@ def print_final_report(run_record: RunRecord,
 
     print(f"\n  DECISIONS:")
     for d in decisions:
-        icon = {
-            'PROMOTED': '✓',
-            'FLAGGED':  '⚑',
-            'REJECTED': '✗',
-        }.get(d.decision_outcome, '?')
+        tag = {
+            'PROMOTED': '[PASS]',
+            'FLAGGED':  '[FLAG]',
+            'REJECTED': '[FAIL]',
+        }.get(d.decision_outcome, '[?]')
         print(
-            f"    {icon} {d.candidate_id:<28} "
+            f"    {tag} {d.candidate_id:<28} "
             f"score={d.composite_score:.3f} "
-            f"→ {d.decision_outcome}"
+            f"-> {d.decision_outcome}"
         )
         if d.flags:
             for flag in d.flags[:2]:
-                print(f"      ⚠ {flag}")
+                print(f"      [!] {flag}")
 
     if run_record.new_strategy_deployed:
-        print(f"\n  ✓ NEW STRATEGY DEPLOYED: "
+        print(f"\n  [PASS] NEW STRATEGY DEPLOYED: "
               f"{run_record.deployed_strategy_id}")
     elif run_record.candidates_flagged > 0:
-        print(f"\n  ⚑ {run_record.candidates_flagged} "
+        print(f"\n  [FLAG] {run_record.candidates_flagged} "
               f"candidate(s) require your review.")
     else:
         print(f"\n  Current strategy remains active.")
@@ -280,6 +282,9 @@ class TrainerRunner:
             Path(__file__).parent.parent /
             'trainer_data' / 'history' / 'decision_log.jsonl'
         )
+        # Verify and load mandate config for prop-rule compliance evaluation (Fix 11.2)
+        from engine.core.mandate import load_mandate, MANDATE_FILE
+        self.mandate = load_mandate(MANDATE_FILE)
 
     def run(self) -> RunRecord:
         """Execute the complete training pipeline."""
@@ -298,15 +303,22 @@ class TrainerRunner:
         all_candidates = []
 
         try:
+            failed_symbols = 0
             for symbol in self.config['symbols']:
                 log.info(
                     f"\nProcessing symbol: {symbol}"
                 )
-                decisions, candidates = self._run_symbol(
-                    symbol, record, kb
-                )
-                all_decisions.extend(decisions)
-                all_candidates.extend(candidates)
+                try:
+                    decisions, candidates = self._run_symbol(
+                        symbol, record, kb
+                    )
+                    all_decisions.extend(decisions)
+                    all_candidates.extend(candidates)
+                    record.symbol_status[symbol] = {'status': 'COMPLETED', 'candidates': len(candidates)}
+                except Exception as sym_err:
+                    failed_symbols += 1
+                    log.error(f"PER_SYMBOL_FAILURE ({symbol}): {sym_err}", exc_info=True)
+                    record.symbol_status[symbol] = {'status': 'FAILED', 'error': str(sym_err)}
 
             # Update knowledge base
             record.layer_start('layer_9_memory')
@@ -321,7 +333,12 @@ class TrainerRunner:
             kb.save()
             record.layer_complete('layer_9_memory')
 
-            record.outcome       = 'COMPLETED'
+            if failed_symbols == len(self.config['symbols']):
+                record.outcome = 'FAILED'
+            elif failed_symbols > 0:
+                record.outcome = 'PARTIAL_FAILURE'
+            else:
+                record.outcome = 'COMPLETED'
             record.completed_at  = datetime.now(timezone.utc)
 
         except Exception as e:
@@ -388,13 +405,21 @@ class TrainerRunner:
             )
 
             # Split: main data + held-out for filter testing
-            held_months = config.get('held_out_months', 2)
-            split_point = df.index[-1] - \
-                __import__('pandas').DateOffset(
-                    months=held_months
-                )
-            df_main     = df[df.index < split_point]
-            df_held_out = df[df.index >= split_point]
+            requested_held = config.get('held_out_months', 2)
+            opt_m = config.get('opt_months', 6)
+            test_m = config.get('test_months', 1)
+            min_main_months = opt_m + test_m
+            total_days = (df.index[-1] - df.index[0]).days
+            total_months = max(1, int(round(total_days / 30.4375)))
+            held_months = max(0, min(requested_held, total_months - min_main_months))
+
+            if held_months > 0:
+                split_point = df.index[-1] - __import__('pandas').DateOffset(months=held_months)
+                df_main     = df[df.index < split_point]
+                df_held_out = df[df.index >= split_point]
+            else:
+                df_main     = df
+                df_held_out = df.iloc[-100:]
 
             log.info(
                 f"Main: {len(df_main):,} candles | "
@@ -468,18 +493,19 @@ class TrainerRunner:
                     f"(score={candidate.composite_score:.3f})"
                 )
 
+                signal_mod = rsi_reversion if candidate.template == 'rsi_reversion' else ma_crossover
+
                 wf = WalkForwardValidator(
                     symbol=symbol,
-                    df=df,
-                    template=candidate.template
-                    if candidate.template in
-                    ['ma_crossover'] else 'ma_crossover',
-                    signal_module=ma_crossover,
+                    df=df_main,
+                    template=candidate.template,
+                    signal_module=signal_mod,
                     opt_months=config['opt_months'],
                     test_months=config['test_months'],
                     initial_equity=config['initial_equity'],
                     min_trades_opt=config['min_trades_opt'],
                     min_trades_test=config['min_trades_test'],
+                    mandate=self.mandate,
                 )
                 wf_windows = wf.run()
                 wf_summary = aggregate_wf_results(wf_windows)
@@ -522,7 +548,11 @@ class TrainerRunner:
 
                 # Hard gate check
                 gate = check_hard_gates(
-                    wf_summary, candidate.candidate_id
+                    wf_summary,
+                    candidate.candidate_id,
+                    mandate=self.mandate,
+                    symbol=symbol,
+                    initial_equity=config['initial_equity']
                 )
 
                 if not gate.passed:
@@ -549,18 +579,39 @@ class TrainerRunner:
                     continue
 
                 # Composite score
-                score = calculate_composite_score(
-                    wf_summary,
-                    candidate_id=candidate.candidate_id,
-                )
-                candidate.composite_score = score.composite
-                candidate.gate_status     = 'PASSED'
-                scored_candidates.append((candidate, score))
+                try:
+                    score = calculate_composite_score(
+                        wf_summary,
+                        candidate_id=candidate.candidate_id,
+                    )
+                    candidate.composite_score = score.composite
+                    candidate.scoring_status  = 'OK'
+                    candidate.gate_status     = 'PASSED'
+                    scored_candidates.append((candidate, score))
+                    log.info(
+                        f"  ✓ {candidate.candidate_id} "
+                        f"score={score.composite:.3f}"
+                    )
+                except Exception as e:
+                    log.error(
+                        f"CANDIDATE_SCORING_CRASH: Composite scoring crashed for {candidate.candidate_id}: {e}",
+                        exc_info=True
+                    )
+                    candidate.composite_score = None
+                    candidate.scoring_status  = 'ERROR'
+                    candidate.scoring_error   = str(e)
+                    candidate.gate_status     = 'SCORING_ERROR'
 
-                log.info(
-                    f"  ✓ {candidate.candidate_id} "
-                    f"score={score.composite:.3f}"
-                )
+                    # Record explicit SCORING_ERROR rejection decision to decision_log.jsonl
+                    from trainer.core.scoring import CompositeScore, GateResult
+                    decision = promotion_engine.decide(
+                        score=CompositeScore(candidate_id=candidate.candidate_id, composite=0.0),
+                        wf_summary=wf_summary,
+                        gate_result=GateResult(candidate_id=candidate.candidate_id, passed=False, failed_gate='SCORING_ERROR', failure_reason=f'Scoring crashed: {e}')
+                    )
+                    decisions.append(decision)
+                    record.candidates_rejected += 1
+                    continue
 
             # Rank and decide on top candidates
             scored_candidates.sort(
@@ -607,5 +658,14 @@ class TrainerRunner:
         except Exception as e:
             record.layer_failed('layer_8_scoring', str(e))
             log.error(f"Scoring failed: {e}")
+
+        # Layer 10: Generate persistent Markdown & HTML reports
+        try:
+            from trainer.core.report import generate_report
+            generate_report(record, candidates, decisions, wf_results_by_candidate)
+            record.layer_complete('layer_10_reporting', {'candidates': len(candidates), 'decisions': len(decisions)})
+        except Exception as e:
+            record.layer_failed('layer_10_reporting', str(e))
+            log.error(f"Report generation failed: {e}")
 
         return decisions, candidates

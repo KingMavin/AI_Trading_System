@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
+from datetime import datetime, timezone, timedelta
 from trainer.core.scoring import (
     check_hard_gates, calculate_composite_score,
     aggregate_wf_results, rank_candidates,
@@ -18,6 +19,25 @@ from trainer.core.promotion import PromotionEngine
 
 
 # ── FIXTURES ───────────────────────────────────────────
+
+def _make_trades(n: int, win_pnl: float = 20.0, loss_pnl: float = -14.0) -> list:
+    """Build a minimal representative OOS trade list, 1 trade per calendar day."""
+    base = datetime(2026, 1, 1, 10, 0, tzinfo=timezone.utc)
+    trades = []
+    for i in range(n):
+        day = base + timedelta(days=i)
+        pnl = win_pnl if i % 2 == 0 else loss_pnl
+        trades.append({
+            'direction': 'BUY',
+            'entry_price': 1.1000,
+            'entry_time': day,
+            'exit_price': 1.1050,
+            'exit_time': day + timedelta(minutes=30),
+            'lots': 0.01,
+            'pnl': pnl,
+        })
+    return trades
+
 
 def good_wf_summary():
     """A walk-forward summary that passes all gates."""
@@ -37,6 +57,8 @@ def good_wf_summary():
         'total_oos_pnl':             4500.0,
         'avg_oos_pnl_per_window':    225.0,
         'regime_windows_min':        4,
+        'mandate_compliant':         True,
+        'all_oos_trades':            _make_trades(450),
     }
 
 def failing_wf_summary():

@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+import pandas as pd
 import numpy as np
 import hashlib
 import json
@@ -40,7 +41,37 @@ from trainer.core.knowledge_base import KnowledgeBase
 from shared.metrics import calculate_metrics
 import trainer.signals.ma_crossover as ma_crossover
 
+import os
+
 log = logging.getLogger(__name__)
+
+
+# ── PROCESS POOL & ISOLATION HELPERS ────────────────────
+
+def get_bounded_pool_size(max_workers: Optional[int] = None) -> int:
+    """
+    Returns bounded worker count for process pools (Fix 9.3).
+    Leaves at least 1 CPU core free for OS/dashboard.
+    """
+    total_cpus = os.cpu_count() or 2
+    bounded_max = max(1, total_cpus - 1)
+    if max_workers is not None and max_workers > 0:
+        return min(max_workers, bounded_max)
+    return bounded_max
+
+
+def execute_isolated_task(task_fn, *args, **kwargs) -> Dict[str, Any]:
+    """
+    Executes a worker task with full exception isolation (Fix 9.3).
+    Catches unhandled worker exceptions, logs full details, and returns
+    a safe failure dictionary instead of crashing the process pool.
+    """
+    try:
+        result = task_fn(*args, **kwargs)
+        return {'status': 'SUCCESS', 'result': result, 'error': None}
+    except Exception as e:
+        log.error(f"WORKER_TASK_FAILURE: Unhandled exception in worker task: {e}", exc_info=True)
+        return {'status': 'FAILED', 'result': None, 'error': str(e)}
 
 
 # ── CANDIDATE CONFIG ───────────────────────────────────
@@ -67,6 +98,7 @@ class CandidateConfig:
     gate_status:          str   = 'PENDING'
     decision_path:        str   = 'PENDING'
     overfit_warning:      bool  = False
+    spec_source:          str   = 'CAPTURED'
 
     def compute_hash(self) -> str:
         """SHA-256 of parameters + filters + symbol + timeframe."""
@@ -159,8 +191,8 @@ class ParameterSearch:
             return calculate_quick_score(metrics, min_trades=20)
 
         except Exception as e:
-            log.debug(f"Backtest error: {e}")
-            return 0.0
+            log.error(f"CANDIDATE_SCORING_CRASH: Quick backtest failed for params {params}: {e}", exc_info=True)
+            return -1.0
 
     def run_grid_search(self, df_opt,
                         candidate_id_prefix: str
@@ -177,7 +209,9 @@ class ParameterSearch:
 
         from shared.instrument_spec import get_spec
         spec = get_spec(self.symbol)
-        spec_pip_size = spec.pip_size if spec else (0.01 if self.symbol == 'USDJPY' else 0.0001)
+        if not spec or not spec.sanity_ok:
+            raise ValueError(f"INSTRUMENT_SPEC_MISSING: Missing or invalid InstrumentSpec for {self.symbol}")
+        spec_pip_size = spec.pip_size
 
         scored = []
         for i, params in enumerate(grid):
@@ -270,127 +304,172 @@ class ParameterSearch:
         )
         return candidates
 
-    def run_bayesian_search(self, df_opt,
-                             candidate_id_prefix: str,
-                             n_calls: int = 50
-                             ) -> List[CandidateConfig]:
+    def run_optuna_search(self, df_opt: pd.DataFrame,
+                          candidate_id_prefix: str,
+                          n_trials: int = 100
+                          ) -> List[CandidateConfig]:
         """
-        Bayesian optimisation for large parameter spaces.
-        Requires: pip install scikit-optimize
-
-        Falls back to grid search if scikit-optimize
-        is not installed.
+        Optuna TPE parameter search for strategy templates.
+        Replaces legacy skopt and exhaustive grid search.
+        Fails loudly if optuna is not installed.
         """
         try:
-            from skopt import gp_minimize
-            from skopt.space import Integer, Real, Categorical
+            import optuna
         except ImportError:
-            log.warning(
-                "scikit-optimize not installed. "
-                "Falling back to grid search. "
-                "Install: pip install scikit-optimize"
+            raise ImportError(
+                "OPTUNA_NOT_INSTALLED: Optuna package is required for parameter search. "
+                "Install via: pip install optuna"
             )
-            return self.run_grid_search(
-                df_opt, candidate_id_prefix
-            )
+
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
 
         space_def = TEMPLATE_SPACES.get(self.template, {})
         if not space_def:
-            return self.run_grid_search(
-                df_opt, candidate_id_prefix
-            )
+            raise ValueError(f"TEMPLATE_SPACE_MISSING: No template space defined for {self.template}")
+
+        from shared.instrument_spec import get_spec
+        from trainer.core.coherence_validator import validate_coherence
+
+        spec = get_spec(self.symbol)
+        if not spec or not spec.sanity_ok:
+            raise ValueError(f"INSTRUMENT_SPEC_MISSING: Missing or invalid InstrumentSpec for {self.symbol}")
 
         log.info(
-            f"Stage 1: Bayesian search {self.template} "
-            f"on {self.symbol} | {n_calls} evaluations"
+            f"Stage 1: Optuna search {self.template} on {self.symbol} | "
+            f"max {n_trials} trials"
         )
-
-        # Build skopt dimension objects
-        dimensions = []
-        dim_names  = []
-
-        for param, values in space_def.items():
-            if isinstance(values[0], int):
-                dimensions.append(
-                    Integer(min(values), max(values), name=param)
-                )
-            elif isinstance(values[0], float):
-                dimensions.append(
-                    Real(min(values), max(values), name=param)
-                )
-            elif isinstance(values[0], str):
-                dimensions.append(
-                    Categorical(values, name=param)
-                )
-            dim_names.append(param)
-
-        # Knowledge base informed starting points
-        x0 = self._get_informed_starting_points(dim_names)
 
         results_store = []
+        visited_hashes = set()
 
-        def objective(x):
-            params = dict(zip(dim_names, x))
+        def objective(trial: optuna.Trial) -> float:
+            params = {}
+            for param, values in space_def.items():
+                if isinstance(values, (list, tuple)):
+                    params[param] = trial.suggest_categorical(param, values)
+                else:
+                    params[param] = values
 
-            # Apply constraints
-            if self.template == 'ma_crossover':
-                if params.get('fast_ma_period', 0) >= \
-                        params.get('slow_ma_period', 1):
-                    return 1.0  # maximally bad (skopt minimises)
+            try:
+                is_coherent, reason = validate_coherence(params, spec)
+            except Exception as e:
+                log.error(f"COHERENCE_VALIDATOR_ERROR: Exception during validate_coherence for params {params}: {e}", exc_info=True)
+                return -1.0
 
-            from shared.instrument_spec import get_spec
-            spec = get_spec(self.symbol)
-            params['pip_size']          = spec.pip_size if spec else (
-                0.01 if self.symbol == 'USDJPY' else 0.0001
+            if not is_coherent:
+                return -1.0
+
+            params['pip_size'] = spec.pip_size
+            params['risk_per_trade_pct'] = 1.0
+            params['warmup_candles'] = 250
+
+            config_hash = CandidateConfig(
+                candidate_id="", template=self.template, symbol=self.symbol,
+                timeframe="M15", parameters=params
+            ).compute_hash()
+
+            if config_hash in visited_hashes:
+                for p, s, h in results_store:
+                    if h == config_hash:
+                        return s
+
+            cached = self.kb.get_cached_score(config_hash, self.data_hash)
+            if cached is not None:
+                score = cached
+            else:
+                score = self._run_quick_backtest(params, df_opt, seed=trial.number)
+                self.kb.record_candidate(
+                    config_hash=config_hash, data_hash=self.data_hash, run_id=self.run_id,
+                    composite_score=score, template=self.template, symbol=self.symbol, params=params
+                )
+
+            self.kb.record_search_trial(
+                template=self.template,
+                symbol=self.symbol,
+                run_id=self.run_id,
+                data_hash=self.data_hash,
+                trial_number=trial.number,
+                params=params,
+                is_coherent=True,
+                composite_score=score,
             )
-            params['risk_per_trade_pct']= 1.0
-            params['warmup_candles']    = 250
-            params['adx_min_threshold'] = 0
-            params['exit_on_opposite_crossover'] = False
 
-            score = self._run_quick_backtest(
-                params, df_opt,
-                seed=len(results_store)
-            )
-            results_store.append((params.copy(), score))
-            return -score  # skopt minimises, we maximise
+            visited_hashes.add(config_hash)
+            results_store.append((params.copy(), score, config_hash))
+            return score
 
-        result = gp_minimize(
-            objective,
-            dimensions,
-            n_calls=n_calls,
-            n_initial_points=min(10, n_calls // 3),
-            x0=x0 if x0 else None,
-            random_state=42,
-            verbose=False,
+        sampler = optuna.samplers.TPESampler(seed=42)
+        study = optuna.create_study(direction="maximize", sampler=sampler)
+
+        # Search Memory Warm-Start Enqueuing
+        top_historical = self.kb.get_top_historical_candidates(
+            template=self.template, symbol=self.symbol, top_k=5
         )
+        if top_historical:
+            enqueued_count = 0
+            for hist_params in top_historical:
+                enqueue_dict = {
+                    k: v for k, v in hist_params.items()
+                    if k in space_def
+                }
+                if enqueue_dict:
+                    study.enqueue_trial(enqueue_dict)
+                    enqueued_count += 1
+            log.info(
+                f"KB_WARMSTART_ENQUEUED: Enqueued {enqueued_count} historical "
+                f"candidates for {self.template} on {self.symbol}"
+            )
 
-        # Sort by score and return top N
+        grid_size = len(get_grid(self.template))
+        max_evals = min(n_trials, grid_size)
+        study.optimize(objective, n_trials=max_evals)
+
+        if not results_store:
+            raise RuntimeError(
+                f"SEARCH_FAILED: Optuna could not find any coherent candidate combination "
+                f"for template '{self.template}' on symbol '{self.symbol}' in {max_evals} trials."
+            )
+
         results_store.sort(key=lambda x: x[1], reverse=True)
         top = results_store[:self.top_n]
 
         candidates = []
-        for idx, (params, score) in enumerate(top):
+        for idx, (params, score, config_hash) in enumerate(top):
             c = CandidateConfig(
-                candidate_id=(
-                    f"{candidate_id_prefix}_bayes{idx+1}"
-                ),
+                candidate_id=f"{candidate_id_prefix}_top{idx+1}",
                 template=self.template,
                 symbol=self.symbol,
                 timeframe='M15',
                 parameters=params,
-                source='bayesian_search',
+                source='parameter_search',
             )
-            c.compute_hash()
-            c.composite_score = score
+            c.config_hash = config_hash
+            if score < 0.0:
+                c.composite_score = None
+                c.scoring_status  = 'ERROR'
+            else:
+                c.composite_score = score
+                c.scoring_status  = 'OK'
             candidates.append(c)
 
         log.info(
-            f"Bayesian search complete: "
-            f"{self.evaluations} evals | "
-            f"Best: {top[0][1]:.3f}"
+            f"Optuna search complete: {len(results_store)} trials evaluated | "
+            f"Top score: {top[0][1]:.3f}"
         )
         return candidates
+
+    def run_grid_search(self, df_opt: pd.DataFrame,
+                        candidate_id_prefix: str
+                        ) -> List[CandidateConfig]:
+        """Alias for Optuna search for backward compatibility."""
+        return self.run_optuna_search(df_opt, candidate_id_prefix)
+
+    def run_bayesian_search(self, df_opt: pd.DataFrame,
+                             candidate_id_prefix: str,
+                             n_calls: int = 50
+                             ) -> List[CandidateConfig]:
+        """Alias for Optuna search for backward compatibility."""
+        return self.run_optuna_search(df_opt, candidate_id_prefix, n_trials=n_calls)
 
     def _get_informed_starting_points(self,
                                        dim_names: List[str]
@@ -486,8 +565,9 @@ class FilterTesting:
                 self.initial_equity
             )
             return calculate_quick_score(metrics, min_trades=10)
-        except Exception:
-            return 0.0
+        except Exception as e:
+            log.error(f"CANDIDATE_SCORING_CRASH: Filter test quick score failed for params {params}: {e}", exc_info=True)
+            return -1.0
 
     def test(self, candidate: CandidateConfig,
              template: str) -> CandidateConfig:
@@ -735,7 +815,7 @@ class CombinationTesting:
             return combo
 
         except Exception as e:
-            log.debug(f"Combination test error: {e}")
+            log.error(f"COMBINATION_TEST_ERROR: Exception during combination test {entry_tmpl}+{exit_tmpl}: {e}", exc_info=True)
             return None
 
 
@@ -837,17 +917,10 @@ class AdaptationSystem:
                 top_n=self.top_n,
             )
 
-            grid_size = len(get_grid(template))
-            if grid_size > 2000:
-                candidates = search.run_bayesian_search(
-                    self.df,
-                    candidate_id_prefix=f"{template}_{self.symbol}"
-                )
-            else:
-                candidates = search.run_grid_search(
-                    self.df,
-                    candidate_id_prefix=f"{template}_{self.symbol}"
-                )
+            candidates = search.run_optuna_search(
+                self.df,
+                candidate_id_prefix=f"{template}_{self.symbol}"
+            )
 
             candidates_by_template[template] = candidates
             all_candidates.extend(candidates)

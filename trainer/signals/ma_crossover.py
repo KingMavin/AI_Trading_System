@@ -47,14 +47,17 @@ def generate_signal(cache: Dict[str, Any],
             return _hold(f"NaN indicator: {name}")
 
     # Optional ADX filter
-    adx_threshold = params.get('adx_min_threshold', 0)
+    adx_threshold = params.get('adx_threshold', params.get('adx_min_threshold', 0))
     if adx_threshold > 0:
         adx = cache.get('adx')
-        if adx is not None and not pd.isna(adx):
-            if adx < adx_threshold:
-                return _hold(
-                    f"ADX {adx:.1f} below threshold {adx_threshold}"
-                )
+        if adx is None or pd.isna(adx):
+            return _hold(
+                f"NaN ADX indicator under active ADX filter {adx_threshold}"
+            )
+        if adx < adx_threshold:
+            return _hold(
+                f"ADX {adx:.1f} below threshold {adx_threshold}"
+            )
 
     # SL and TP calculation
     sl_distance = atr * params.get('sl_atr_multiple', 1.5)

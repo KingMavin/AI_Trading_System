@@ -15,6 +15,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import json
 import shutil
+import logging
+log = logging.getLogger(__name__)
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field, asdict
@@ -74,6 +76,7 @@ class KnowledgeBase:
                 'trainer_data' / 'history' /
                 'knowledge_base.json'
             )
+        self.search_history_path = self.path.parent / 'search_history.jsonl'
         self.backup_dir = self.path.parent / 'backups'
         self.data       = self._load()
 
@@ -91,8 +94,7 @@ class KnowledgeBase:
             with open(self.path) as f:
                 return json.load(f)
         except Exception as e:
-            print(f"Warning: KB load failed ({e}). "
-                  f"Initialising fresh.")
+            log.warning(f"KB_LOAD_FAILED: Knowledge base load failed ({e}). Initialising fresh.")
             return _empty_knowledge_base()
 
     def _save(self, data: Dict = None) -> None:
@@ -123,7 +125,7 @@ class KnowledgeBase:
         """Public save method."""
         self._save()
 
-    # ── DEDUPLICATION ──────────────────────────────────
+    # ── DEDUPLICATION & SEARCH HISTORY ─────────────────
 
     def has_been_tested(self, config_hash: str,
                         data_hash: str) -> bool:
@@ -153,6 +155,9 @@ class KnowledgeBase:
                          symbol:      str,
                          params:      Dict) -> None:
         """Record a tested candidate in the knowledge base."""
+        ignored_keys = {'pip_size', 'risk_per_trade_pct', 'warmup_candles'}
+        clean_params = {k: v for k, v in params.items() if k not in ignored_keys}
+
         self.data['candidate_results'][config_hash] = {
             'data_hash':       data_hash,
             'run_id':          run_id,
@@ -162,12 +167,183 @@ class KnowledgeBase:
             'composite_score': composite_score,
             'template':        template,
             'symbol':          symbol,
-            'params_summary': {
-                k: v for k, v in params.items()
-                if k in ['fast_ma_period', 'slow_ma_period',
-                         'sl_atr_multiple', 'tp_rr_ratio',
-                         'ma_type']
+            'params_summary':  clean_params,
+        }
+
+    def record_search_trial(self, template: str,
+                            symbol: str,
+                            run_id: str,
+                            data_hash: str,
+                            trial_number: int,
+                            params: Dict,
+                            is_coherent: bool,
+                            composite_score: float) -> None:
+        """Append an Optuna search trial to search_history.jsonl."""
+        ignored_keys = {'pip_size', 'risk_per_trade_pct', 'warmup_candles'}
+        clean_params = {k: v for k, v in params.items() if k not in ignored_keys}
+
+        record = {
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'run_id': run_id,
+            'template': template,
+            'symbol': symbol,
+            'data_hash': data_hash,
+            'trial_number': trial_number,
+            'parameters': clean_params,
+            'is_coherent': is_coherent,
+            'composite_score': composite_score,
+        }
+
+        try:
+            self.search_history_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.search_history_path, 'a') as f:
+                f.write(json.dumps(record) + '\n')
+        except Exception as e:
+            log.warning(f"SEARCH_HISTORY_WRITE_FAILED: Failed to append search trial ({e})")
+
+    def get_top_historical_candidates(self, template: str,
+                                       symbol: str,
+                                       top_k: int = 5) -> List[Dict]:
+        """
+        Query search_history.jsonl and candidate_results to return top_k
+        historical parameter combinations for (template, symbol) with score > 0.0.
+        """
+        candidates = []
+
+        # 1. Read from search_history.jsonl if present
+        if self.search_history_path.exists():
+            try:
+                with open(self.search_history_path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        rec = json.loads(line)
+                        if (rec.get('template') == template and
+                                rec.get('symbol') == symbol and
+                                rec.get('composite_score', -1.0) > 0.0 and
+                                rec.get('is_coherent', True)):
+                            candidates.append((rec['composite_score'], rec['parameters']))
+            except Exception as e:
+                log.warning(f"SEARCH_HISTORY_READ_FAILED: ({e})")
+
+        # 2. Read from knowledge_base.json candidate_results
+        for entry in self.data.get('candidate_results', {}).values():
+            if (entry.get('template') == template and
+                    entry.get('symbol') == symbol and
+                    entry.get('composite_score', -1.0) > 0.0):
+                candidates.append((entry['composite_score'], entry.get('params_summary', {})))
+
+        if not candidates:
+            log.info(
+                f"KB_WARMSTART_SPARSE: 0 historical candidates found for template "
+                f"'{template}' on symbol '{symbol}'. Proceeding with standard TPESampler search."
+            )
+            return []
+
+        # Deduplicate candidates by param string
+        unique_candidates = {}
+        for score, params in candidates:
+            key = json.dumps(params, sort_keys=True)
+            if key not in unique_candidates or score > unique_candidates[key][0]:
+                unique_candidates[key] = (score, params)
+
+        sorted_top = sorted(unique_candidates.values(), key=lambda x: x[0], reverse=True)
+        return [params for score, params in sorted_top[:top_k]]
+
+    @staticmethod
+    def bucket_parameters(template: str, params: Dict) -> Dict[str, str]:
+        """
+        Map parameter values to coarse region buckets.
+        """
+        buckets = {}
+        if template == 'ma_crossover':
+            fast = params.get('fast_ma_period', 10)
+            if fast <= 15:
+                buckets['fast_ma_period'] = 'SHORT'
+            elif fast <= 30:
+                buckets['fast_ma_period'] = 'MEDIUM'
+            else:
+                buckets['fast_ma_period'] = 'LONG'
+
+            slow = params.get('slow_ma_period', 50)
+            if slow <= 60:
+                buckets['slow_ma_period'] = 'MEDIUM'
+            elif slow <= 120:
+                buckets['slow_ma_period'] = 'LONG'
+            else:
+                buckets['slow_ma_period'] = 'EXTRA_LONG'
+
+            sl = params.get('sl_atr_multiple', 1.5)
+            buckets['sl_atr_multiple'] = 'TIGHT' if sl <= 1.5 else 'WIDE'
+
+            tp = params.get('tp_rr_ratio', 2.0)
+            buckets['tp_rr_ratio'] = 'LOW' if tp <= 2.0 else 'HIGH'
+
+            adx = params.get('adx_threshold', params.get('adx_min_threshold', 0))
+            if adx == 0:
+                buckets['adx_threshold'] = 'DISABLED'
+            elif adx <= 15:
+                buckets['adx_threshold'] = 'WEAK'
+            elif adx <= 20:
+                buckets['adx_threshold'] = 'MODERATE'
+            else:
+                buckets['adx_threshold'] = 'STRONG'
+
+        return buckets
+
+    def get_region_statistics(self, template: str,
+                              symbol: str,
+                              min_samples: int = 30) -> Dict[str, Any]:
+        """
+        Compute regional score statistics across historical trials.
+        Only returns non-empty statistics if total_samples >= min_samples (N >= 30).
+        """
+        all_trials = []
+        if self.search_history_path.exists():
+            try:
+                with open(self.search_history_path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        rec = json.loads(line)
+                        if rec.get('template') == template and rec.get('symbol') == symbol:
+                            all_trials.append(rec)
+            except Exception as e:
+                log.warning(f"REGION_STATS_READ_FAILED: ({e})")
+
+        if len(all_trials) < min_samples:
+            return {
+                'total_samples': len(all_trials),
+                'min_samples_met': False,
+                'region_scores': {},
             }
+
+        region_scores: Dict[str, List[float]] = {}
+        for trial in all_trials:
+            score = trial.get('composite_score', -1.0)
+            if score < 0.0:
+                continue
+            b_dict = self.bucket_parameters(template, trial.get('parameters', {}))
+            region_key = "|".join(f"{k}={v}" for k, v in sorted(b_dict.items()))
+            if region_key not in region_scores:
+                region_scores[region_key] = []
+            region_scores[region_key].append(score)
+
+        summary = {}
+        for r_key, scores in region_scores.items():
+            if scores:
+                summary[r_key] = {
+                    'count': len(scores),
+                    'mean_score': sum(scores) / len(scores),
+                    'max_score': max(scores),
+                }
+
+        return {
+            'total_samples': len(all_trials),
+            'min_samples_met': True,
+            'region_scores': summary,
         }
 
     # ── TEMPLATE PERFORMANCE ───────────────────────────

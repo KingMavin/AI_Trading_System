@@ -53,9 +53,12 @@ def run_backtest(symbol:  str = 'EURUSD',
     Returns:
         result dict with trades, equity_curve, metrics
     """
+    from shared.instrument_spec import get_spec
+    spec = get_spec(symbol)
+    if not spec or not spec.sanity_ok:
+        raise ValueError(f"INSTRUMENT_SPEC_MISSING: Missing or invalid InstrumentSpec for {symbol}")
     params = params or DEFAULT_PARAMS.copy()
-    params['pip_size'] = (0.01 if symbol == 'USDJPY'
-                          else 0.0001)
+    params['pip_size'] = spec.pip_size
 
     print(f"\nLoading {symbol} M15 data ({start} → {end})...")
     df = load_ohlcv(

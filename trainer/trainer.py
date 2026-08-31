@@ -17,7 +17,9 @@ Usage:
 
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+repo_root = str(Path(__file__).resolve().parent.parent)
+if sys.path[0] != repo_root:
+    sys.path.insert(0, repo_root)
 
 import argparse
 from trainer.core.trainer_runner import (
@@ -37,6 +39,18 @@ def cmd_run(args):
         config['data_start'] = args.start
     if args.end:
         config['data_end'] = args.end
+    if getattr(args, 'opt_months', None) is not None:
+        config['opt_months'] = args.opt_months
+    if getattr(args, 'test_months', None) is not None:
+        config['test_months'] = args.test_months
+    if getattr(args, 'held_out_months', None) is not None:
+        config['held_out_months'] = args.held_out_months
+    if getattr(args, 'min_trades_opt', None) is not None:
+        config['min_trades_opt'] = args.min_trades_opt
+    if getattr(args, 'min_trades_test', None) is not None:
+        config['min_trades_test'] = args.min_trades_test
+    if getattr(args, 'top_n', None) is not None:
+        config['top_n_candidates'] = args.top_n
 
     runner = TrainerRunner(
         config=config,
@@ -155,7 +169,7 @@ def cmd_rollback(args):
           "engine/strategy/active_strategy.json")
 
 
-if __name__ == '__main__':
+def build_parser():
     parser = argparse.ArgumentParser(
         description='ATS Trainer — adaptive strategy training'
     )
@@ -167,7 +181,7 @@ if __name__ == '__main__':
     )
     run_parser.add_argument(
         '--symbol',
-        choices=['EURUSD', 'GBPUSD', 'USDJPY'],
+        choices=['EURUSD', 'GBPUSD', 'USDJPY', 'USDCAD', 'XAUUSD'],
         help='Single symbol to train on'
     )
     run_parser.add_argument(
@@ -182,6 +196,36 @@ if __name__ == '__main__':
         '--quick',
         action='store_true',
         help='Quick mode — smaller grid, shorter period'
+    )
+    run_parser.add_argument(
+        '--opt-months',
+        type=int,
+        help='In-sample optimization window duration in months'
+    )
+    run_parser.add_argument(
+        '--test-months',
+        type=int,
+        help='Out-of-sample test window duration in months'
+    )
+    run_parser.add_argument(
+        '--held-out-months',
+        type=int,
+        help='Months reserved at dataset end for Stage 2 filter testing'
+    )
+    run_parser.add_argument(
+        '--min-trades-opt',
+        type=int,
+        help='Minimum required in-sample trades per window'
+    )
+    run_parser.add_argument(
+        '--min-trades-test',
+        type=int,
+        help='Minimum required out-of-sample trades per window'
+    )
+    run_parser.add_argument(
+        '--top-n',
+        type=int,
+        help='Top N candidates to evaluate across gates'
     )
     run_parser.set_defaults(func=cmd_run)
 
@@ -202,7 +246,10 @@ if __name__ == '__main__':
         'rollback', help='Roll back to previous strategy'
     )
     rollback_parser.set_defaults(func=cmd_rollback)
+    return parser
 
+if __name__ == '__main__':
+    parser = build_parser()
     args = parser.parse_args()
 
     if not args.command:
