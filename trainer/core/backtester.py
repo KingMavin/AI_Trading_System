@@ -87,6 +87,11 @@ class Backtester:
         self.balance        = initial_equity
         self.peak_equity    = initial_equity
 
+        # State & Halts (WAVE 38)
+        self.strategy_state = {}
+        self.last_closed_trade = None
+        self.daily_halt_active = False
+
         # Position tracking
         self.open_position: Optional[Dict] = None
         self.closed_trades: List[Dict]     = []
@@ -96,6 +101,7 @@ class Backtester:
             signal_module) -> Dict:
         """
         Run backtest on DataFrame.
+        Evaluates signals on candle close, executes fills on next candle open (zero look-ahead).
 
         Args:
             df:            OHLCV DataFrame with DatetimeIndex
@@ -110,59 +116,103 @@ class Backtester:
 
         # Main candle loop
         warmup = self.params.get('warmup_candles', 250)
+        pending_entry: Optional[Dict] = None
+        pending_exit: Optional[Dict] = None
+
+        # Date rollover tracking
+        current_date = None
+        daily_start_equity = self.equity
+        daily_loss_halt_pct = self.params.get('daily_loss_halt_pct', 0.0)
+        dates = features.index.date
 
         for i in range(warmup, len(features)):
             row     = features.iloc[i]
             row_prev= features.iloc[i - 1]
 
+            # Rollover check
+            if current_date is None or dates[i] > current_date:
+                current_date = dates[i]
+                daily_start_equity = self.balance + self._unrealised_pnl(row['close'])
+                self.daily_halt_active = False
+
+            # Daily halt evaluation
+            if daily_loss_halt_pct > 0.0 and not self.daily_halt_active:
+                current_equity = self.balance + self._unrealised_pnl(row['close'])
+                daily_pnl_pct = ((current_equity - daily_start_equity) / daily_start_equity) * 100.0 if daily_start_equity > 0 else -100.0
+                if daily_pnl_pct <= -daily_loss_halt_pct:
+                    self.daily_halt_active = True
+
             # Build indicator cache
             cache = self._build_cache(row, row_prev)
+            
+            # Inject state (reference semantics, WAVE 38)
+            cache['strategy_state'] = self.strategy_state
+            cache['last_closed_trade'] = self.last_closed_trade
 
-            # Skip Dead Zone
+            # Process pending signal-based exit from candle i-1 at candle i's open
+            if pending_exit and self.open_position:
+                self._close_position(
+                    price=row['open'],
+                    candle_time=row.name,
+                    reason=pending_exit['reason'],
+                    cache=cache
+                )
+                pending_exit = None
+
+            # Process pending entry signal from candle i-1 at candle i's open
+            if pending_entry and self.open_position is None:
+                self._open_position(
+                    signal=pending_entry['signal'],
+                    base_price=row['open'],
+                    candle_time=row.name,
+                    cache=cache
+                )
+                pending_entry = None
+
+            # Skip Dead Zone for new evaluations/checks. Note: pending entry/exit execution above
+            # is NOT gated by session because orders queued prior to Dead Zone execute at market open tick.
             if cache['session'] == 'DEAD_ZONE':
                 continue
 
-            # Step 1: Check SL/TP on open position
+            # Step 1: Check SL/TP on open position during candle i
             if self.open_position:
                 self._check_sl_tp(row, cache)
 
-            # Step 2: Check signal-based exit
-            if self.open_position:
+            # Step 2: Check signal-based exit (evaluated at candle i close, queued for candle i+1 open)
+            if self.open_position and pending_exit is None:
                 exit_result = signal_module.check_exit(
                     cache, self.open_position, self.params
                 )
                 if exit_result['should_exit']:
-                    self._close_position(
-                        price=cache['close'],
-                        candle_time=row.name,
-                        reason=exit_result['reason'],
-                        cache=cache
-                    )
+                    pending_exit = {'reason': exit_result['reason']}
 
-            # Step 3: Generate entry signal
-            if self.open_position is None:
+            # Daily halt re-evaluation in case a position closed intracandle
+            if daily_loss_halt_pct > 0.0 and not self.daily_halt_active:
+                current_equity = self.balance + self._unrealised_pnl(row['close'])
+                daily_pnl = ((current_equity - daily_start_equity) / daily_start_equity) * 100.0 if daily_start_equity > 0 else -100.0
+                if daily_pnl <= -daily_loss_halt_pct:
+                    self.daily_halt_active = True
+
+            # Step 3: Generate entry signal (evaluated at candle i close, queued for candle i+1 open)
+            if self.open_position is None and pending_entry is None and not self.daily_halt_active:
                 signal = signal_module.generate_signal(
                     cache, self.params
                 )
                 if signal['signal'] in ('BUY', 'SELL'):
-                    self._open_position(
-                        signal=signal,
-                        candle_time=row.name,
-                        cache=cache
-                    )
+                    pending_entry = {'signal': signal}
 
             # Record equity
             unrealised = self._unrealised_pnl(cache['close'])
             self.equity_curve.append(self.balance + unrealised)
 
-        # Close any open position at end
+        # Close any open position at end of data
         if self.open_position:
             last_row = features.iloc[-1]
             last_cache = self._build_cache(
                 last_row, features.iloc[-2]
             )
             self._close_position(
-                price=last_cache['close'],
+                price=last_row['close'],
                 candle_time=last_row.name,
                 reason='END_OF_DATA',
                 cache=last_cache
@@ -190,10 +240,14 @@ class Backtester:
             f['sma_fast'] = calculate_sma(df, fast)
             f['sma_slow'] = calculate_sma(df, slow)
 
+        f['rsi']        = calculate_rsi(df, 14)
+        bb              = calculate_bbands(df, 20, 2.0)
+        f['bb_pct']     = bb['bb_pct']
         f['atr']        = calculate_atr(df, 14)
         adx_result      = calculate_adx(df, 14)
         f['adx']        = adx_result['adx']
         f['volume_sma'] = calculate_volume_sma(df, 20)
+        f['volume_rel'] = f['volume'] / f['volume_sma']
         f['atr_sma20']  = f['atr'].rolling(20).mean()
         f['atr_ratio']  = f['atr'] / f['atr_sma20']
         f['session']    = calculate_session(df)
@@ -201,6 +255,13 @@ class Backtester:
             df, f['adx'], f['atr']
         )
         return f
+
+    @staticmethod
+    def _clean_float(val, default: float) -> float:
+        """Sanitize float values, guarding against None, NaN, or inf during warmup."""
+        if val is None or pd.isna(val) or np.isinf(val):
+            return float(default)
+        return float(val)
 
     def _build_cache(self, row, row_prev) -> Dict:
         """Build indicator cache for current candle."""
@@ -214,10 +275,14 @@ class Backtester:
             'sma_fast_prev': row_prev['sma_fast'],
             'sma_slow':      row['sma_slow'],
             'sma_slow_prev': row_prev['sma_slow'],
-            'atr':           row['atr'],
-            'adx':           row['adx'],
-            'atr_ratio':     row.get('atr_ratio', 1.0),
-            'volume_sma':    row['volume_sma'],
+            'rsi':           self._clean_float(row.get('rsi'), 50.0),
+            'rsi_prev':      self._clean_float(row_prev.get('rsi'), 50.0),
+            'bb_pct':        self._clean_float(row.get('bb_pct'), 0.5),
+            'atr':           self._clean_float(row.get('atr'), 0.0),
+            'adx':           self._clean_float(row.get('adx'), 0.0),
+            'atr_ratio':     self._clean_float(row.get('atr_ratio'), 1.0),
+            'volume_sma':    row.get('volume_sma', row['volume']),
+            'volume_rel':    self._clean_float(row.get('volume_rel'), 1.0),
             'session':       row['session'],
             'regime':        row['regime'],
         }
@@ -252,9 +317,10 @@ class Backtester:
         return self.instrument_spec.lot_size_for_risk(self.balance, risk_pct, distance)
 
     def _open_position(self, signal: Dict,
+                        base_price: float,
                         candle_time,
                         cache: Dict) -> None:
-        """Open a new position."""
+        """Open a new position at base_price (next candle open) + spread / slip."""
         direction   = signal['signal']
         spread_pips = self._simulated_spread(cache)
         slip_pips   = self._simulated_slippage(cache)
@@ -262,9 +328,9 @@ class Backtester:
         slip        = slip_pips * self.pip_size
 
         if direction == 'BUY':
-            entry_price = cache['close'] + (spread / 2) + slip
+            entry_price = base_price + (spread / 2) + slip
         else:
-            entry_price = cache['close'] - (spread / 2) - slip
+            entry_price = base_price - (spread / 2) - slip
 
         sl_price = signal['sl_price']
         tp_price = signal['tp_price']
@@ -273,6 +339,13 @@ class Backtester:
         commission  = lots * 7.0 / 2  # Hardcoded $7/lot RT
 
         self.balance -= commission
+
+        # Distance from fast MA specifically (sma_fast), in price ticks
+        fast_ma = cache.get('sma_fast')
+        if fast_ma is not None and not pd.isna(fast_ma) and self.instrument_spec and self.instrument_spec.tick_size > 0:
+            ma_dist_ticks = abs(entry_price - fast_ma) / self.instrument_spec.tick_size
+        else:
+            ma_dist_ticks = 0.0
 
         self.open_position = {
             'direction':     direction,
@@ -288,6 +361,16 @@ class Backtester:
             'candles_open':  0,
             'highest_price': entry_price,
             'lowest_price':  entry_price,
+            # Category A/B Feature Snapshot (captured at entry-open time)
+            'rsi':              self._clean_float(cache.get('rsi'), 50.0),
+            'bb_pct':           self._clean_float(cache.get('bb_pct'), 0.5),
+            'volatility_atr':   self._clean_float(cache.get('atr'), 0.0),
+            'volatility_ratio': self._clean_float(cache.get('atr_ratio'), 1.0),
+            'volume_relative':  self._clean_float(cache.get('volume_rel'), 1.0),
+            'ma_distance_ticks':round(ma_dist_ticks, 2),
+            'hour_utc':         candle_time.hour,
+            'day_of_week':      candle_time.weekday(),
+            'accrued_swap':     0.0,  # Snapshotting at entry-open time before rollover
         }
 
     def _check_sl_tp(self, row, cache: Dict) -> None:
@@ -386,24 +469,42 @@ class Backtester:
         self.peak_equity = max(self.peak_equity, self.equity)
 
         self.closed_trades.append({
-            'direction':      pos['direction'],
-            'entry_price':    pos['entry_price'],
-            'entry_time':     pos['entry_time'],
-            'exit_price':     price,
-            'exit_time':      candle_time,
-            'lots':           pos['lots'],
-            'gross_pnl':      round(gross_pnl, 2),
-            'net_pnl':        round(net_pnl, 2),
-            'commission':     round(pos['commission_open'] + commission_close, 2),
-            'swap_cost':      round(swap_cost, 2),
-            'close_reason':   reason,
-            'duration_candles':pos['candles_open'],
-            'entry_session':  pos['entry_session'],
-            'entry_regime':   pos['entry_regime'],
-            'exit_session':   cache['session'],
+            'direction':         pos['direction'],
+            'entry_price':       pos['entry_price'],
+            'entry_time':        pos['entry_time'],
+            'exit_price':        price,
+            'exit_time':         candle_time,
+            'lots':              pos['lots'],
+            'gross_pnl':         round(gross_pnl, 2),
+            'net_pnl':           round(net_pnl, 2),
+            'commission':        round(pos['commission_open'] + commission_close, 2),
+            'swap_cost':         round(swap_cost, 2),
+            'close_reason':      reason,
+            'duration_candles':  pos['candles_open'],
+            'entry_session':     pos['entry_session'],
+            'entry_regime':      pos['entry_regime'],
+            'exit_session':      cache['session'],
+            # Feature Snapshot fields
+            'rsi':               pos.get('rsi'),
+            'bb_pct':            pos.get('bb_pct'),
+            'volatility_atr':    pos.get('volatility_atr'),
+            'volatility_ratio':  pos.get('volatility_ratio'),
+            'volume_relative':   pos.get('volume_relative'),
+            'ma_distance_ticks': pos.get('ma_distance_ticks'),
+            'hour_utc':          pos.get('hour_utc'),
+            'day_of_week':       pos.get('day_of_week'),
+            'accrued_swap':      pos.get('accrued_swap', 0.0),
         })
 
         self.open_position = None
+        
+        # Clear per-trade strategy state (WAVE 38)
+        self.strategy_state.clear()
+        self.last_closed_trade = {
+            'net_pnl': net_pnl,
+            'direction': pos['direction'],
+            'reason': reason
+        }
 
     def _unrealised_pnl(self, current_price: float) -> float:
         """Calculate unrealised P&L on open position."""

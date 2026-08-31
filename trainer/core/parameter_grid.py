@@ -27,10 +27,22 @@ MA_CROSSOVER_SPACE = {
     'ma_type':          ['SMA'],
     'sl_atr_multiple':  [1.0, 1.5, 2.0],
     'tp_rr_ratio':      [1.5, 2.0, 2.5],
+    'adx_threshold':    [0, 15, 20, 25, 30],
+}
+
+RSI_REVERSION_SPACE = {
+    'rsi_period':       [14],
+    'rsi_oversold':     [20, 25, 30, 35],
+    'rsi_overbought':   [65, 70, 75, 80],
+    'exit_on_midline':  [True, False],
+    'sl_atr_multiple':  [1.0, 1.5, 2.0],
+    'tp_rr_ratio':      [1.5, 2.0, 2.5],
+    'adx_threshold':    [0, 15, 20, 25, 30],
 }
 
 TEMPLATE_SPACES = {
     'ma_crossover': MA_CROSSOVER_SPACE,
+    'rsi_reversion': RSI_REVERSION_SPACE,
 }
 
 
@@ -40,7 +52,7 @@ def get_grid(template: str,
     Generate all valid parameter combinations for a template.
 
     Args:
-        template:     template name e.g. 'ma_crossover'
+        template:     template name e.g. 'ma_crossover', 'rsi_reversion'
         custom_space: override default space if provided
 
     Returns:
@@ -64,12 +76,17 @@ def get_grid(template: str,
         # Apply template-specific constraints
         if template == 'ma_crossover':
             # fast_ma must be strictly less than slow_ma
-            if params['fast_ma_period'] >= params['slow_ma_period']:
+            if params.get('fast_ma_period', 0) >= params.get('slow_ma_period', 0):
+                continue
+        elif template == 'rsi_reversion':
+            # rsi_oversold must be strictly less than rsi_overbought
+            if params.get('rsi_oversold', 0) >= params.get('rsi_overbought', 100):
                 continue
 
         # Add fixed params not in search space
         params['risk_per_trade_pct']       = 1.0
-        params['adx_min_threshold']        = 0
+        params['adx_threshold']            = params.get('adx_threshold', 0)
+        params['adx_min_threshold']        = params['adx_threshold']
         params['exit_on_opposite_crossover'] = False
         params['warmup_candles']           = 250
 
