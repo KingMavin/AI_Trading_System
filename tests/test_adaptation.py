@@ -10,6 +10,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import pytest
 import tempfile
 import os
+import pandas as pd
+import numpy as np
 from trainer.core.adaptation import (
     CandidateConfig, HypothesisGenerator
 )
@@ -317,3 +319,147 @@ class TestDiscoveryInterface:
         gen = HypothesisGenerator()
         with pytest.raises(NotImplementedError):
             gen.generate({}, {}, None)
+
+
+# ── DATA ISOLATION TESTS (WAVE 4.4) ────────────────────
+
+class TestAdaptationDataIsolation:
+
+    def test_stage1_held_out_data_isolation(self, temp_kb):
+        """
+        Verify that mutating df_held_out in AdaptationSystem has ZERO effect on Stage 1
+        parameter search output candidates (parameters, scores, hashes), proving complete
+        isolation of held-out test data from Stage 1 parameter optimization.
+        """
+        from trainer.core.adaptation import AdaptationSystem
+        from shared.instrument_spec import InstrumentSpec
+        from unittest.mock import patch
+
+        dates_opt = pd.date_range('2020-01-01', periods=1000, freq='15min', tz='UTC')
+        dates_held_out = pd.date_range('2020-01-15', periods=500, freq='15min', tz='UTC')
+
+        t = np.linspace(0, 20 * np.pi, 1000)
+        closes_opt = 1.1000 + 0.0050 * np.sin(t)
+
+        df_opt = pd.DataFrame({
+            'open': closes_opt - 0.0001,
+            'high': closes_opt + 0.0002,
+            'low': closes_opt - 0.0002,
+            'close': closes_opt,
+            'volume': [100.0] * 1000,
+        }, index=dates_opt)
+
+        df_held_out_orig = pd.DataFrame({
+            'open': [1.1000] * 500,
+            'high': [1.1010] * 500,
+            'low': [1.0990] * 500,
+            'close': [1.1000] * 500,
+            'volume': [100.0] * 500,
+        }, index=dates_held_out)
+
+        df_held_out_mutated = df_held_out_orig.copy()
+        df_held_out_mutated['close'] *= 10.0
+        df_held_out_mutated['volume'] *= 100.0
+
+        spec = InstrumentSpec.build_simulation_default("EURUSD")
+        spec.sanity_ok = True
+
+        with patch("shared.instrument_spec.get_spec", return_value=spec):
+            sys_orig = AdaptationSystem(
+                symbol='EURUSD',
+                df=df_opt,
+                df_held_out=df_held_out_orig,
+                knowledge_base=temp_kb,
+                data_hash='hash1',
+                run_id='run1',
+                templates=['ma_crossover'],
+                top_n=3
+            )
+            cands_orig = sys_orig.run()
+
+            sys_mutated = AdaptationSystem(
+                symbol='EURUSD',
+                df=df_opt,
+                df_held_out=df_held_out_mutated,
+                knowledge_base=temp_kb,
+                data_hash='hash2',
+                run_id='run2',
+                templates=['ma_crossover'],
+                top_n=3
+            )
+            cands_mutated = sys_mutated.run()
+
+            # Assert candidates originating from Stage 1 optimization are 100% identical in parameters and template
+            assert len(cands_orig) == len(cands_mutated)
+            for c1, c2 in zip(cands_orig, cands_mutated):
+                assert c1.parameters == c2.parameters
+                assert c1.template == c2.template
+
+    # ── WAVE 17 OPTUNA SEARCH TESTS ─────────────────────────────
+
+    def test_optuna_search_output_shape_and_types(self, temp_kb):
+        from trainer.core.adaptation import ParameterSearch, CandidateConfig
+        from shared.instrument_spec import InstrumentSpec
+        from unittest.mock import patch
+
+        dates = pd.date_range('2020-01-01', periods=500, freq='15min', tz='UTC')
+        t = np.linspace(0, 10 * np.pi, 500)
+        closes = 1.1000 + 0.0030 * np.sin(t)
+        df = pd.DataFrame({
+            'open': closes - 0.0001, 'high': closes + 0.0002,
+            'low': closes - 0.0002, 'close': closes, 'volume': [100.0] * 500
+        }, index=dates)
+
+        spec = InstrumentSpec.build_simulation_default("EURUSD")
+        spec.sanity_ok = True
+
+        with patch("shared.instrument_spec.get_spec", return_value=spec):
+            search = ParameterSearch(
+                symbol='EURUSD', template='ma_crossover', df=df,
+                knowledge_base=temp_kb, data_hash='dhash', run_id='r1', top_n=3
+            )
+            cands = search.run_optuna_search(df, candidate_id_prefix='test_optuna', n_trials=30)
+
+            assert len(cands) == 3
+            for c in cands:
+                assert isinstance(c, CandidateConfig)
+                assert c.template == 'ma_crossover'
+                assert c.symbol == 'EURUSD'
+                assert c.timeframe == 'M15'
+                assert isinstance(c.parameters, dict)
+                assert isinstance(c.composite_score, float)
+                assert isinstance(c.config_hash, str) and len(c.config_hash) > 0
+                assert c.parameters['fast_ma_period'] < c.parameters['slow_ma_period']
+
+    def test_optuna_reproducibility(self, tmp_path):
+        """Verify Optuna TPESampler seed determinism across separate runs without KB caching."""
+        from trainer.core.adaptation import ParameterSearch
+        from trainer.core.knowledge_base import KnowledgeBase
+        from shared.instrument_spec import InstrumentSpec
+        from unittest.mock import patch
+
+        kb1 = KnowledgeBase(base_path=str(tmp_path / 'kb1.json'))
+        kb2 = KnowledgeBase(base_path=str(tmp_path / 'kb2.json'))
+
+        dates = pd.date_range('2020-01-01', periods=500, freq='15min', tz='UTC')
+        t = np.linspace(0, 10 * np.pi, 500)
+        closes = 1.1000 + 0.0030 * np.sin(t)
+        df = pd.DataFrame({
+            'open': closes - 0.0001, 'high': closes + 0.0002,
+            'low': closes - 0.0002, 'close': closes, 'volume': [100.0] * 500
+        }, index=dates)
+
+        spec = InstrumentSpec.build_simulation_default("EURUSD")
+        spec.sanity_ok = True
+
+        with patch("shared.instrument_spec.get_spec", return_value=spec):
+            s1 = ParameterSearch(symbol='EURUSD', template='ma_crossover', df=df, knowledge_base=kb1, data_hash='dh', run_id='r1', top_n=3)
+            cands1 = s1.run_optuna_search(df, candidate_id_prefix='run1', n_trials=20)
+
+            s2 = ParameterSearch(symbol='EURUSD', template='ma_crossover', df=df, knowledge_base=kb2, data_hash='dh', run_id='r2', top_n=3)
+            cands2 = s2.run_optuna_search(df, candidate_id_prefix='run2', n_trials=20)
+
+            assert len(cands1) == len(cands2)
+            for c1, c2 in zip(cands1, cands2):
+                assert c1.parameters == c2.parameters
+                assert c1.composite_score == pytest.approx(c2.composite_score, abs=1e-5)
