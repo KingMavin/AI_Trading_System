@@ -12,7 +12,7 @@ import pytest
 import json
 import tempfile
 from datetime import datetime, timezone
-from shared.instrument_spec import InstrumentSpec, load_specs, save_specs
+from shared.instrument_spec import InstrumentSpec, SANITY_RANGES, load_specs, save_specs
 from trainer.core.backtester import Backtester
 
 
@@ -305,3 +305,78 @@ class TestBacktesterIntegration:
 
         assert cost == pytest.approx(-0.7)
         mod.SPEC_CACHE_PATH = original_path
+
+    def test_backtester_charges_swap_cost_for_overnight_sell_trade(
+            self, tmp_path):
+        import shared.instrument_spec as mod
+        original_path = mod.SPEC_CACHE_PATH
+        mod.SPEC_CACHE_PATH = tmp_path / "specs.json"
+
+        spec = make_spec(
+            symbol="EURUSD",
+            swap_long=-0.7,
+            swap_short=-1.0,
+        )
+        save_specs({"EURUSD": spec})
+
+        bt = Backtester(
+            symbol="EURUSD",
+            params={},
+        )
+
+        entry = datetime(2026, 6, 1, 10, 0, tzinfo=timezone.utc)
+        exit = datetime(2026, 6, 2, 10, 0, tzinfo=timezone.utc)
+        cost = bt._calculate_swap_cost(
+            direction='SELL',
+            lots=1.0,
+            entry_time=entry,
+            exit_time=exit,
+        )
+
+        assert cost == pytest.approx(-1.0)
+        mod.SPEC_CACHE_PATH = original_path
+
+
+class TestXauusdRealCapturedBrokerData:
+
+    def test_xauusd_real_captured_broker_data_sanity_ok(self):
+        """
+        Regression test using real broker-captured MT5 data for XAUUSD from 2026-07-27.
+        Attributes: tick_value=0.1, digits=2, point=0.01, contract_size=100.0, tick_size=0.01.
+        Verifies that sanity_ok evaluates to True with the updated SANITY_RANGES bounds [0.05, 0.20].
+        """
+        # Real broker-reported MT5 values for XAUUSD (captured 2026-07-27)
+        tv = 0.10
+        sanity = SANITY_RANGES.get("XAUUSD", {})
+        tv_min = sanity.get("tick_value_min", 0.01)
+        tv_max = sanity.get("tick_value_max", 10.0)
+        san_ok = tv_min <= tv <= tv_max
+
+        spec = InstrumentSpec(
+            symbol           = "XAUUSD",
+            digits           = 2,
+            point            = 0.01,
+            contract_size    = 100.0,
+            tick_size        = 0.01,
+            tick_value       = tv,
+            volume_min       = 0.01,
+            volume_step      = 0.01,
+            volume_max       = 100.0,
+            stops_level      = 0,
+            spread_typical   = 13,
+            swap_long        = -12.6,
+            swap_short       = -4.6,
+            currency_base    = "XAU",
+            currency_profit  = "USD",
+            currency_margin  = "USD",
+            account_currency = "USD",
+            captured_at      = "2026-07-27T20:25:25.234683+00:00",
+            sanity_ok        = san_ok,
+        )
+
+        assert spec.sanity_ok is True
+        assert spec.pip_size == pytest.approx(0.01)
+        assert spec.pip_value == pytest.approx(0.10)
+        lots = spec.lot_size_for_risk(account_balance=10000.0, risk_pct=1.0, sl_distance_price=5.0)
+        assert lots > 0.0
+

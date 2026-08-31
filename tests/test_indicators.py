@@ -397,10 +397,147 @@ class TestRegime:
         atr = calculate_atr(eurusd_m15, period=14)
         adx = calculate_adx(eurusd_m15, period=14)['adx']
         result = calculate_regime(eurusd_m15, adx, atr)
-        # After warmup all values should be valid strings
         after_warmup = result.dropna()
         valid = {
             'TRENDING', 'RANGING', 'VOLATILE',
             'QUIET', 'TRANSITIONING'
         }
         assert set(after_warmup.unique()).issubset(valid)
+
+
+# ── SHARPE RATIO TESTS ─────────────────────────────────
+
+class TestSharpeRatio:
+
+    def test_sharpe_annualization_with_trades_per_year(self):
+        from shared.metrics import _calculate_sharpe
+        # 100 trades over 1.0 year -> trades_per_year = 100
+        # PnLs: mean = 10.0, std = 10.0 -> per-trade Sharpe = 1.0
+        # Expected annualized Sharpe = 1.0 * sqrt(100) = 10.0
+        pnls = [15.0, 5.0] * 50  # mean=10, std=5.025...
+        arr = np.array(pnls)
+        expected_mean = np.mean(arr)
+        expected_std = np.std(arr, ddof=1)
+        expected_sharpe = (expected_mean / expected_std) * np.sqrt(100 / 1.0)
+        
+        calc_sharpe = _calculate_sharpe(pnls, years=1.0)
+        assert calc_sharpe == pytest.approx(expected_sharpe, rel=1e-4)
+
+    def test_sharpe_degenerate_cases(self):
+        from shared.metrics import _calculate_sharpe
+        assert _calculate_sharpe([]) == 0.0
+        assert _calculate_sharpe([10.0]) == 0.0
+        assert _calculate_sharpe([10.0, 10.0]) == 0.0  # std == 0
+        assert _calculate_sharpe([10.0, -5.0], years=0.0) == 0.0
+
+    def test_sharpe_hand_calculated_values(self):
+        from shared.metrics import _calculate_sharpe
+        # Hand Calculation:
+        # pnls = [100.0, 100.0, 100.0, -50.0] (4 trades), years = 0.5
+        # mean = (100 + 100 + 100 - 50) / 4 = 62.5
+        # diffs from mean = [37.5, 37.5, 37.5, -112.5]
+        # sq_diffs = [1406.25, 1406.25, 1406.25, 12656.25]
+        # sum_sq_diffs = 16875.0
+        # variance (ddof=1) = 16875.0 / 3 = 5625.0
+        # std = sqrt(5625.0) = 75.0
+        # per-trade Sharpe = 62.5 / 75.0 = 5/6 = 0.8333333333333334
+        # trades_per_year = 4 / 0.5 = 8.0
+        # sqrt(trades_per_year) = sqrt(8.0) = 2.8284271247461903
+        # annualized_sharpe = (5/6) * sqrt(8.0) = 2.3570226039551585
+        pnls = [100.0, 100.0, 100.0, -50.0]
+        calc = _calculate_sharpe(pnls, years=0.5)
+        assert calc == pytest.approx(2.3570226039551585, rel=1e-6)
+
+    def test_sharpe_annualization_scales_with_years(self):
+        from shared.metrics import _calculate_sharpe
+        pnls = [100.0, 100.0, 100.0, -50.0]
+        s1 = _calculate_sharpe(pnls, years=1.0)
+        s2 = _calculate_sharpe(pnls, years=2.0)
+        # Doubling years halves trades_per_year, so Sharpe scales by 1/sqrt(2)
+        assert s2 == pytest.approx(s1 / np.sqrt(2.0), rel=1e-6)
+
+    def test_sharpe_regression_guard_old_candles_formula(self):
+        from shared.metrics import _calculate_sharpe
+        # 50 trades in 1 year
+        pnls = [100.0, 100.0, 100.0, -50.0] * 12 + [100.0, 100.0]
+        calc = _calculate_sharpe(pnls, years=1.0)
+        # Old bug formula: (mean / std) * sqrt(24192) = (62.5 / 75.0) * 155.53778 = 129.6148
+        # Correct new formula: (mean / std) * sqrt(50) = (62.5 / 75.0) * 7.0710678 = 5.892556
+        old_inflated_sharpe = (62.5 / 75.0) * np.sqrt(96 * 252)
+        assert calc < 0.1 * old_inflated_sharpe
+
+
+@pytest.mark.parametrize("t0", [14, 15, 20, 21, 50])
+@pytest.mark.parametrize("future_offset", [1, 5])
+def test_look_ahead_bias_in_all_indicators(small_df, t0, future_offset):
+    """
+    Parametrized look-ahead audit test for all indicators in shared/indicators.py.
+    Tests multiple cutoff rows (t0 = 14, 15, 20, 21, 50) and future offsets (t+1 immediate next candle, t+5).
+    Asserts bitwise exact identity (check_exact=True) for all prior rows t <= t0.
+    """
+    t_future = t0 + future_offset
+    if t_future >= len(small_df):
+        pytest.skip("t_future out of bounds")
+
+    # Mutate a copy of small_df at t_future
+    df_mutated = small_df.copy()
+    df_mutated.iloc[t_future, df_mutated.columns.get_loc('open')] *= 2.0
+    df_mutated.iloc[t_future, df_mutated.columns.get_loc('high')] *= 2.0
+    df_mutated.iloc[t_future, df_mutated.columns.get_loc('low')] *= 0.5
+    df_mutated.iloc[t_future, df_mutated.columns.get_loc('close')] *= 2.0
+    df_mutated.iloc[t_future, df_mutated.columns.get_loc('volume')] *= 10.0
+
+    # 1. SMA
+    sma_orig = calculate_sma(small_df, 14)
+    sma_mut = calculate_sma(df_mutated, 14)
+    pd.testing.assert_series_equal(sma_orig.iloc[:t0+1], sma_mut.iloc[:t0+1], check_exact=True)
+
+    # 2. EMA
+    ema_orig = calculate_ema(small_df, 14)
+    ema_mut = calculate_ema(df_mutated, 14)
+    pd.testing.assert_series_equal(ema_orig.iloc[:t0+1], ema_mut.iloc[:t0+1], check_exact=True)
+
+    # 3. RSI
+    rsi_orig = calculate_rsi(small_df, 14)
+    rsi_mut = calculate_rsi(df_mutated, 14)
+    pd.testing.assert_series_equal(rsi_orig.iloc[:t0+1], rsi_mut.iloc[:t0+1], check_exact=True)
+
+    # 4. MACD
+    macd_orig = calculate_macd(small_df, 12, 26, 9)
+    macd_mut = calculate_macd(df_mutated, 12, 26, 9)
+    for k in macd_orig:
+        pd.testing.assert_series_equal(macd_orig[k].iloc[:t0+1], macd_mut[k].iloc[:t0+1], check_exact=True)
+
+    # 5. ATR
+    atr_orig = calculate_atr(small_df, 14)
+    atr_mut = calculate_atr(df_mutated, 14)
+    pd.testing.assert_series_equal(atr_orig.iloc[:t0+1], atr_mut.iloc[:t0+1], check_exact=True)
+
+    # 6. Bollinger Bands
+    bb_orig = calculate_bbands(small_df, 20, 2.0)
+    bb_mut = calculate_bbands(df_mutated, 20, 2.0)
+    for k in bb_orig:
+        pd.testing.assert_series_equal(bb_orig[k].iloc[:t0+1], bb_mut[k].iloc[:t0+1], check_exact=True)
+
+    # 7. ADX
+    adx_orig = calculate_adx(small_df, 14)
+    adx_mut = calculate_adx(df_mutated, 14)
+    for k in adx_orig:
+        pd.testing.assert_series_equal(adx_orig[k].iloc[:t0+1], adx_mut[k].iloc[:t0+1], check_exact=True)
+
+    # 8. Volume SMA
+    v_orig = calculate_volume_sma(small_df, 20)
+    v_mut = calculate_volume_sma(df_mutated, 20)
+    pd.testing.assert_series_equal(v_orig.iloc[:t0+1], v_mut.iloc[:t0+1], check_exact=True)
+
+    # 9. Session
+    sess_orig = calculate_session(small_df)
+    sess_mut = calculate_session(df_mutated)
+    pd.testing.assert_series_equal(sess_orig.iloc[:t0+1], sess_mut.iloc[:t0+1], check_exact=True)
+
+    # 10. Regime
+    reg_orig = calculate_regime(small_df, adx_orig['adx'], atr_orig)
+    reg_mut = calculate_regime(df_mutated, adx_mut['adx'], atr_mut)
+    pd.testing.assert_series_equal(reg_orig.iloc[:t0+1], reg_mut.iloc[:t0+1], check_exact=True)
+
+
