@@ -135,8 +135,9 @@ class TestConfiguration:
         assert len(DEFAULT_CONFIG['templates']) > 0
 
     def test_opt_months_greater_than_test_months(self):
-        assert DEFAULT_CONFIG['opt_months'] > \
-               DEFAULT_CONFIG['test_months']
+        from trainer.core.trainer_runner import DEFAULT_TEMPLATE_TEST_MONTHS
+        test_m = DEFAULT_CONFIG.get('test_months') or max(DEFAULT_TEMPLATE_TEST_MONTHS.values())
+        assert DEFAULT_CONFIG['opt_months'] > test_m
 
     def test_valid_symbols(self):
         valid = {'EURUSD', 'GBPUSD', 'USDJPY'}

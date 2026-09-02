@@ -44,12 +44,17 @@ log = logging.getLogger(__name__)
 
 # ── DEFAULT CONFIGURATION ──────────────────────────────
 
+DEFAULT_TEMPLATE_TEST_MONTHS = {
+    'ma_crossover': 1,
+    'rsi_reversion': 2
+}
+
 DEFAULT_CONFIG = {
     'symbols':          ['EURUSD'],
     'timeframe':        'M15',
-    'templates':        ['ma_crossover'],
+    'templates':        ['rsi_reversion'],
     'opt_months':       6,
-    'test_months':      1,
+    'test_months':      None,
     'initial_equity':   10000.0,
     'top_n_candidates': 5,
     'min_trades_opt':   30,
@@ -179,8 +184,9 @@ def print_run_header(config: Dict, run_id: str) -> None:
     print(f"  Templates: {', '.join(config['templates'])}")
     print(f"  Period:    {config['data_start']} -> "
           f"{config['data_end']}")
+    test_m_str = config.get('test_months') or 'auto'
     print(f"  OPT/TEST:  {config['opt_months']}m / "
-          f"{config['test_months']}m windows")
+          f"{test_m_str}m windows")
     print(f"  Equity:    ${config['initial_equity']:,.0f}")
     print(f"{'='*60}\n")
 
@@ -407,7 +413,7 @@ class TrainerRunner:
             # Split: main data + held-out for filter testing
             requested_held = config.get('held_out_months', 2)
             opt_m = config.get('opt_months', 6)
-            test_m = config.get('test_months', 1)
+            test_m = config.get('test_months') or max(DEFAULT_TEMPLATE_TEST_MONTHS.values())
             min_main_months = opt_m + test_m
             total_days = (df.index[-1] - df.index[0]).days
             total_months = max(1, int(round(total_days / 30.4375)))
@@ -495,13 +501,17 @@ class TrainerRunner:
 
                 signal_mod = rsi_reversion if candidate.template == 'rsi_reversion' else ma_crossover
 
+                resolved_test_months = config.get('test_months')
+                if resolved_test_months is None:
+                    resolved_test_months = DEFAULT_TEMPLATE_TEST_MONTHS.get(candidate.template, 1)
+                
                 wf = WalkForwardValidator(
                     symbol=symbol,
                     df=df_main,
                     template=candidate.template,
                     signal_module=signal_mod,
                     opt_months=config['opt_months'],
-                    test_months=config['test_months'],
+                    test_months=resolved_test_months,
                     initial_equity=config['initial_equity'],
                     min_trades_opt=config['min_trades_opt'],
                     min_trades_test=config['min_trades_test'],
