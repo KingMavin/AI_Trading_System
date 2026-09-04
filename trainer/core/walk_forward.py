@@ -143,7 +143,8 @@ class WalkForwardValidator:
                  initial_equity:float       = 10000.0,
                  min_trades_opt:int         = 30,
                  min_trades_test:int        = 10,
-                 mandate                    = None):
+                 mandate                    = None,
+                 knowledge_base             = None):
 
         self.symbol         = symbol
         self.df             = df
@@ -155,6 +156,7 @@ class WalkForwardValidator:
         self.min_trades_opt = min_trades_opt
         self.min_trades_test= min_trades_test
         self.mandate        = mandate
+        self.kb             = knowledge_base
 
         # Sanity gate — refuse before any WF window starts
         from shared.instrument_spec import get_spec
@@ -272,7 +274,8 @@ class WalkForwardValidator:
 
     def _optimise(self, df_opt: pd.DataFrame,
                   window_num: int,
-                  n_trials: int = 50
+                  n_trials: int = 50,
+                  is_dominant_regime: str = 'UNKNOWN'
                   ) -> Tuple[Optional[Dict], float, Optional[Dict]]:
         """
         Find best parameters on training window.
@@ -301,19 +304,37 @@ class WalkForwardValidator:
 
         optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-        best_score   = -1.0
+        best_score   = 0.0
         best_params  = None
         best_metrics = None
 
-        opt_seed = window_num * 1000 + 42
+        opt_seed = 42 + window_num
+        
+        # Decide sampler based on grid size vs n_trials
         if len(self.param_grid) <= n_trials:
-            sampler = optuna.samplers.GridSampler({'param_idx': list(range(len(self.param_grid)))})
+            search_space = {'param_idx': range(len(self.param_grid))}
+            sampler = optuna.samplers.GridSampler(search_space, seed=opt_seed)
             max_evals = len(self.param_grid)
         else:
             sampler = optuna.samplers.TPESampler(seed=opt_seed)
             max_evals = n_trials
 
         study = optuna.create_study(direction="maximize", sampler=sampler)
+
+        # Enqueue historical candidates matching the current in-sample regime
+        if self.kb is not None:
+            top_historical = self.kb.get_top_historical_candidates(
+                template=self.template, 
+                symbol=self.symbol, 
+                top_k=5, 
+                target_regime=is_dominant_regime
+            )
+            for hist_params in top_historical:
+                # Find matching index in current grid
+                for idx, grid_param in enumerate(self.param_grid):
+                    if all(hist_params.get(k) == v for k, v in grid_param.items()):
+                        study.enqueue_trial({'param_idx': idx})
+                        break
 
         def objective(trial: optuna.Trial) -> float:
             nonlocal best_score, best_params, best_metrics
@@ -334,6 +355,19 @@ class WalkForwardValidator:
                 best_score   = score
                 best_params  = params_eval.copy()
                 best_metrics = metrics
+
+            if self.kb is not None:
+                self.kb.record_search_trial(
+                    template=self.template,
+                    symbol=self.symbol,
+                    run_id=f"wf_{window_num}",
+                    data_hash="wf_slice",
+                    trial_number=trial.number,
+                    params=params_eval,
+                    is_coherent=is_coherent,
+                    composite_score=score,
+                    in_sample_regime=is_dominant_regime
+                )
 
             return score
 
@@ -404,6 +438,20 @@ class WalkForwardValidator:
                 results.append(result)
                 continue
 
+            # Calculate dominant regime for the training window (WAVE 34)
+            is_dominant_regime = 'UNKNOWN'
+            try:
+                adx_res_opt = calculate_adx(df_opt)
+                atr_s_opt = calculate_atr(df_opt)
+                regimes_s_opt = calculate_regime(df_opt, adx_res_opt['adx'], atr_s_opt)
+                ts_start_opt = pd.Timestamp(w['opt_start']).tz_localize('UTC') if pd.Timestamp(w['opt_start']).tzinfo is None else pd.Timestamp(w['opt_start']).tz_convert('UTC')
+                is_regimes = regimes_s_opt[df_opt.index >= ts_start_opt]
+                modes_opt = is_regimes.mode()
+                if not modes_opt.empty:
+                    is_dominant_regime = modes_opt[0]
+            except Exception as e:
+                log.warning(f"Window {wn}: IS Regime calculation failed: {e}", exc_info=True)
+
             # Calculate dominant regime for the test window
             try:
                 adx_res = calculate_adx(df_test)
@@ -420,7 +468,7 @@ class WalkForwardValidator:
                 
             # Step 1: Optimise on training window
             best_params, best_score, is_metrics = \
-                self._optimise(df_opt, wn)
+                self._optimise(df_opt, wn, is_dominant_regime=is_dominant_regime)
 
             if best_params is None or best_score == 0:
                 result.status = 'INSUFFICIENT_TRADES'

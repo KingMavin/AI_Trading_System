@@ -516,6 +516,7 @@ class TrainerRunner:
                     min_trades_opt=config['min_trades_opt'],
                     min_trades_test=config['min_trades_test'],
                     mandate=self.mandate,
+                    knowledge_base=kb,
                 )
                 wf_windows = wf.run()
                 wf_summary = aggregate_wf_results(wf_windows)

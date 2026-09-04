@@ -392,6 +392,7 @@ class ParameterSearch:
                 params=params,
                 is_coherent=True,
                 composite_score=score,
+                in_sample_regime='UNKNOWN'
             )
 
             visited_hashes.add(config_hash)

@@ -177,7 +177,8 @@ class KnowledgeBase:
                             trial_number: int,
                             params: Dict,
                             is_coherent: bool,
-                            composite_score: float) -> None:
+                            composite_score: float,
+                            in_sample_regime: str = 'UNKNOWN') -> None:
         """Append an Optuna search trial to search_history.jsonl."""
         ignored_keys = {'pip_size', 'risk_per_trade_pct', 'warmup_candles'}
         clean_params = {k: v for k, v in params.items() if k not in ignored_keys}
@@ -192,6 +193,7 @@ class KnowledgeBase:
             'parameters': clean_params,
             'is_coherent': is_coherent,
             'composite_score': composite_score,
+            'in_sample_regime': in_sample_regime,
         }
 
         try:
@@ -203,12 +205,15 @@ class KnowledgeBase:
 
     def get_top_historical_candidates(self, template: str,
                                        symbol: str,
-                                       top_k: int = 5) -> List[Dict]:
+                                       top_k: int = 5,
+                                       target_regime: str = 'UNKNOWN') -> List[Dict]:
         """
         Query search_history.jsonl and candidate_results to return top_k
         historical parameter combinations for (template, symbol) with score > 0.0.
+        Prioritizes candidates matching target_regime, backfilling with others.
         """
-        candidates = []
+        regime_candidates = []
+        other_candidates = []
 
         # 1. Read from search_history.jsonl if present
         if self.search_history_path.exists():
@@ -223,7 +228,11 @@ class KnowledgeBase:
                                 rec.get('symbol') == symbol and
                                 rec.get('composite_score', -1.0) > 0.0 and
                                 rec.get('is_coherent', True)):
-                            candidates.append((rec['composite_score'], rec['parameters']))
+                            score_param = (rec['composite_score'], rec['parameters'])
+                            if rec.get('in_sample_regime', 'UNKNOWN') == target_regime:
+                                regime_candidates.append(score_param)
+                            else:
+                                other_candidates.append(score_param)
             except Exception as e:
                 log.warning(f"SEARCH_HISTORY_READ_FAILED: ({e})")
 
@@ -232,24 +241,33 @@ class KnowledgeBase:
             if (entry.get('template') == template and
                     entry.get('symbol') == symbol and
                     entry.get('composite_score', -1.0) > 0.0):
-                candidates.append((entry['composite_score'], entry.get('params_summary', {})))
+                score_param = (entry['composite_score'], entry.get('params_summary', {}))
+                # knowledge_base.json doesn't track regime, put in other
+                other_candidates.append(score_param)
 
-        if not candidates:
+        regime_candidates.sort(key=lambda x: x[0], reverse=True)
+        other_candidates.sort(key=lambda x: x[0], reverse=True)
+
+        # Deduplicate while preserving order
+        final_candidates = []
+        seen = set()
+        
+        for _, p in regime_candidates + other_candidates:
+            h = str(sorted(p.items()))
+            if h not in seen:
+                seen.add(h)
+                final_candidates.append(p)
+                if len(final_candidates) >= top_k:
+                    break
+
+        if not final_candidates:
             log.info(
                 f"KB_WARMSTART_SPARSE: 0 historical candidates found for template "
                 f"'{template}' on symbol '{symbol}'. Proceeding with standard TPESampler search."
             )
             return []
 
-        # Deduplicate candidates by param string
-        unique_candidates = {}
-        for score, params in candidates:
-            key = json.dumps(params, sort_keys=True)
-            if key not in unique_candidates or score > unique_candidates[key][0]:
-                unique_candidates[key] = (score, params)
-
-        sorted_top = sorted(unique_candidates.values(), key=lambda x: x[0], reverse=True)
-        return [params for score, params in sorted_top[:top_k]]
+        return final_candidates
 
     @staticmethod
     def bucket_parameters(template: str, params: Dict) -> Dict[str, str]:
