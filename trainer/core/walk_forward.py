@@ -27,6 +27,7 @@ from trainer.core.backtester import Backtester
 from trainer.core.parameter_grid import get_grid
 from shared.metrics import calculate_metrics
 from shared.instrument_spec import get_spec
+from shared.indicators import calculate_adx, calculate_atr, calculate_regime
 import trainer.signals.ma_crossover as ma_crossover
 
 logging.basicConfig(
@@ -73,6 +74,9 @@ class WindowResult:
     # Prop-Firm Mandate Compliance (Fix 11.2)
     oos_mandate_compliant:     bool = True
     oos_mandate_breach_reason: Optional[str] = None
+
+    # Regime Tagging (WAVE 33)
+    oos_dominant_regime:       str = 'UNKNOWN'
 
     # Raw OOS trades for Monte Carlo stress testing (WAVE 14)
     oos_trades_list:           List[Dict] = field(default_factory=list)
@@ -400,6 +404,20 @@ class WalkForwardValidator:
                 results.append(result)
                 continue
 
+            # Calculate dominant regime for the test window
+            try:
+                adx_res = calculate_adx(df_test)
+                atr_s = calculate_atr(df_test)
+                regimes_s = calculate_regime(df_test, adx_res['adx'], atr_s)
+                # Slice to strict OOS period to exclude warmup
+                ts_start = pd.Timestamp(w['test_start']).tz_localize('UTC') if pd.Timestamp(w['test_start']).tzinfo is None else pd.Timestamp(w['test_start']).tz_convert('UTC')
+                oos_regimes = regimes_s[df_test.index >= ts_start]
+                modes = oos_regimes.mode()
+                if not modes.empty:
+                    result.oos_dominant_regime = modes[0]
+            except Exception as e:
+                log.warning(f"Window {wn}: Regime calculation failed: {e}", exc_info=True)
+                
             # Step 1: Optimise on training window
             best_params, best_score, is_metrics = \
                 self._optimise(df_opt, wn)

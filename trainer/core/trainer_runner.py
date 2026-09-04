@@ -45,14 +45,14 @@ log = logging.getLogger(__name__)
 # ── DEFAULT CONFIGURATION ──────────────────────────────
 
 DEFAULT_TEMPLATE_TEST_MONTHS = {
-    'ma_crossover': 1,
+    'ma_crossover': 3,
     'rsi_reversion': 2
 }
 
 DEFAULT_CONFIG = {
     'symbols':          ['EURUSD'],
     'timeframe':        'M15',
-    'templates':        ['rsi_reversion'],
+    'templates':        ['ma_crossover'],
     'opt_months':       6,
     'test_months':      None,
     'initial_equity':   10000.0,

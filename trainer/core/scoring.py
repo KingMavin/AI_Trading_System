@@ -600,6 +600,7 @@ def aggregate_wf_results(window_results: list) -> Dict:
         all_oos_trades.extend(getattr(r, 'oos_trades_list', []))
 
     win_rate_list = [r.oos_win_rate for r in valid]
+    regimes_list = [getattr(r, 'oos_dominant_regime', 'UNKNOWN') for r in valid]
 
     return {
         'valid_windows':             len(valid),
@@ -620,6 +621,7 @@ def aggregate_wf_results(window_results: list) -> Dict:
         'mandate_compliant':         mandate_compliant,
         'mandate_breach_reason':     mandate_breach_reason,
         'all_oos_trades':            all_oos_trades,
+        'window_regimes':            regimes_list,
     }
 
 
