@@ -119,6 +119,26 @@ def calculate_bbands(df: pd.DataFrame,
     }
 
 
+def calculate_donchian_channel(df: pd.DataFrame, period: int = 20) -> dict:
+    """
+    Donchian Channel.
+    Returns dict with keys: 'upper', 'lower', 'mid'
+    Shifted by 1 to avoid look-ahead bias (represents previous N periods).
+    """
+    if period < 1:
+        raise IndicatorError(f"Donchian period must be >= 1, got {period}")
+    
+    upper = df['high'].rolling(window=period).max().shift(1)
+    lower = df['low'].rolling(window=period).min().shift(1)
+    mid = (upper + lower) / 2.0
+    
+    return {
+        'upper': upper,
+        'lower': lower,
+        'mid': mid
+    }
+
+
 # ── TREND ──────────────────────────────────────────────
 
 def calculate_adx(df: pd.DataFrame, period: int = 14) -> dict:

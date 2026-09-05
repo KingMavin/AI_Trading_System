@@ -133,8 +133,12 @@ class SignalEngine:
         vol_sma = calculate_volume_sma(df, 20)
 
         # RSI
-        from shared.indicators import calculate_rsi
+        from shared.indicators import calculate_rsi, calculate_donchian_channel
         rsi_series = calculate_rsi(df, period=spec.parameters.get('rsi_period', 14))
+
+        # Donchian Channels
+        d_entry = calculate_donchian_channel(df, spec.parameters.get('channel_period', 20))
+        d_exit  = calculate_donchian_channel(df, spec.parameters.get('exit_period', 10))
 
         # ATR ratio for regime detection
         atr_sma20 = atr_series.rolling(20).mean()
@@ -177,6 +181,10 @@ class SignalEngine:
             'adx':          float(adx_series.iloc[-1])
                             if not pd.isna(adx_series.iloc[-1])
                             else None,
+            'donchian_upper_entry': float(d_entry['upper'].iloc[-1]) if not pd.isna(d_entry['upper'].iloc[-1]) else None,
+            'donchian_lower_entry': float(d_entry['lower'].iloc[-1]) if not pd.isna(d_entry['lower'].iloc[-1]) else None,
+            'donchian_upper_exit':  float(d_exit['upper'].iloc[-1])  if not pd.isna(d_exit['upper'].iloc[-1])  else None,
+            'donchian_lower_exit':  float(d_exit['lower'].iloc[-1])  if not pd.isna(d_exit['lower'].iloc[-1])  else None,
             'atr_ratio':    float(atr_ratio.iloc[-1])
                             if not pd.isna(atr_ratio.iloc[-1])
                             else 1.0,
@@ -191,10 +199,17 @@ class SignalEngine:
     def _generate_signal(self, cache: Dict) -> Dict:
         spec = self.spec
 
-        # Template delegation for rsi_reversion
+        # Template delegation for templates
         if spec.template == 'rsi_reversion':
             import trainer.signals.rsi_reversion as rsi_reversion
             res = rsi_reversion.generate_signal(cache, spec.parameters)
+            res['session'] = cache.get('session')
+            res['regime'] = cache.get('regime')
+            res['candle_time'] = str(cache.get('candle_time', ''))
+            return res
+        elif spec.template == 'donchian_breakout':
+            import trainer.signals.donchian_breakout as donchian_breakout
+            res = donchian_breakout.generate_signal(cache, spec.parameters)
             res['session'] = cache.get('session')
             res['regime'] = cache.get('regime')
             res['candle_time'] = str(cache.get('candle_time', ''))

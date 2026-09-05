@@ -34,6 +34,7 @@ from trainer.core.promotion import PromotionEngine
 from trainer.core.knowledge_base import KnowledgeBase
 import trainer.signals.ma_crossover as ma_crossover
 import trainer.signals.rsi_reversion as rsi_reversion
+import trainer.signals.donchian_breakout as donchian_breakout
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,13 +47,14 @@ log = logging.getLogger(__name__)
 
 DEFAULT_TEMPLATE_TEST_MONTHS = {
     'ma_crossover': 3,
-    'rsi_reversion': 2
+    'rsi_reversion': 2,
+    'donchian_breakout': 3
 }
 
 DEFAULT_CONFIG = {
     'symbols':          ['EURUSD'],
     'timeframe':        'M15',
-    'templates':        ['ma_crossover'],
+    'templates':        ['donchian_breakout'],
     'opt_months':       6,
     'test_months':      None,
     'initial_equity':   10000.0,
@@ -499,7 +501,12 @@ class TrainerRunner:
                     f"(score={candidate.composite_score:.3f})"
                 )
 
-                signal_mod = rsi_reversion if candidate.template == 'rsi_reversion' else ma_crossover
+                if candidate.template == 'rsi_reversion':
+                    signal_mod = rsi_reversion
+                elif candidate.template == 'donchian_breakout':
+                    signal_mod = donchian_breakout
+                else:
+                    signal_mod = ma_crossover
 
                 resolved_test_months = config.get('test_months')
                 if resolved_test_months is None:

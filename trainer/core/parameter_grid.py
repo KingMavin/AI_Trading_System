@@ -38,11 +38,22 @@ RSI_REVERSION_SPACE = {
     'sl_atr_multiple':  [1.0, 1.5, 2.0],
     'tp_rr_ratio':      [1.5, 2.0, 2.5],
     'adx_threshold':    [0, 15, 20, 25, 30],
+    'cooldown_requires_midline': [True, False],
+    'daily_loss_halt_pct': [0.0, 1.5, 2.0, 2.5, 3.0],
+}
+
+DONCHIAN_BREAKOUT_SPACE = {
+    'channel_period':   [20, 40, 60, 80, 120],
+    'exit_period':      [5, 10, 20, 40],
+    'sl_atr_multiple':  [1.0, 1.5, 2.0],
+    'tp_rr_ratio':      [1.5, 2.0, 2.5, 3.0],
+    'adx_threshold':    [0, 15, 20, 25, 30],
 }
 
 TEMPLATE_SPACES = {
     'ma_crossover': MA_CROSSOVER_SPACE,
     'rsi_reversion': RSI_REVERSION_SPACE,
+    'donchian_breakout': DONCHIAN_BREAKOUT_SPACE,
 }
 
 
@@ -81,6 +92,10 @@ def get_grid(template: str,
         elif template == 'rsi_reversion':
             # rsi_oversold must be strictly less than rsi_overbought
             if params.get('rsi_oversold', 0) >= params.get('rsi_overbought', 100):
+                continue
+        elif template == 'donchian_breakout':
+            # exit_period must be less than channel_period
+            if params.get('exit_period', 0) >= params.get('channel_period', 0):
                 continue
 
         # Add fixed params not in search space
