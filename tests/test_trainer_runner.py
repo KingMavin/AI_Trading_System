@@ -140,7 +140,7 @@ class TestConfiguration:
         assert DEFAULT_CONFIG['opt_months'] > test_m
 
     def test_valid_symbols(self):
-        valid = {'EURUSD', 'GBPUSD', 'USDJPY'}
+        valid = {'EURUSD', 'GBPUSD', 'USDJPY', 'XAUUSD'}
         for sym in DEFAULT_CONFIG['symbols']:
             assert sym in valid
 
