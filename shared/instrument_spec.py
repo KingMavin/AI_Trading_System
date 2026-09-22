@@ -30,14 +30,15 @@ log = logging.getLogger(__name__)
 SPEC_CACHE_PATH = OUTPUT_ROOT / "state" / "instrument_specs.json"
 
 # ── SANITY RANGES ──────────────────────────────────────
-# Used to detect anomalous broker-reported values
-# (e.g. XAUUSD tick_value of 0.10 on a weekend snapshot)
+# Used to detect anomalous broker-reported values.
+# XAUUSD: tick_value is 0.10 for 100-oz contracts under standard MT5 tick reporting.
+# Range [0.05, 0.20] provides headroom for account currency variations (e.g. EUR/USD conversion).
 SANITY_RANGES = {
     "EURUSD": {"tick_value_min": 0.50, "tick_value_max": 1.50},
     "GBPUSD": {"tick_value_min": 0.50, "tick_value_max": 1.50},
     "USDJPY": {"tick_value_min": 0.30, "tick_value_max": 1.20},
     "USDCAD": {"tick_value_min": 0.30, "tick_value_max": 1.20},
-    "XAUUSD": {"tick_value_min": 0.50, "tick_value_max": 1.50},
+    "XAUUSD": {"tick_value_min": 0.05, "tick_value_max": 0.20},
 }
 
 

@@ -77,7 +77,7 @@ def calculate_metrics(trades: List[Dict],
               if max_dd_pct > 0 else float('inf'))
 
     # ── Sharpe Ratio ──────────────────────────────────
-    sharpe = _calculate_sharpe(net_pnls)
+    sharpe = _calculate_sharpe(net_pnls, years=years)
 
     # ── Consecutive losses ────────────────────────────
     max_consec_losses = _max_consecutive_losses(net_pnls)
@@ -127,18 +127,22 @@ def _calculate_max_drawdown(equity: np.ndarray) -> float:
 
 
 def _calculate_sharpe(pnls: List[float],
+                       years: float = 1.0,
                        risk_free: float = 0.0) -> float:
-    """Sharpe ratio. Risk-free rate = 0 for simplicity."""
-    if len(pnls) < 2:
+    """
+    Annualised Sharpe ratio based on trade returns.
+    Risk-free rate = 0.0 by default (personal CFD/FX system with no cash benchmark).
+    Annualised via trades_per_year = len(pnls) / years.
+    """
+    if len(pnls) < 2 or years <= 0:
         return 0.0
     arr = np.array(pnls)
     mean = np.mean(arr) - risk_free
     std  = np.std(arr, ddof=1)
     if std == 0:
         return 0.0
-    # Annualise assuming M15 — sqrt of candles per year
-    candles_per_year = 96 * 252
-    return float(mean / std * np.sqrt(candles_per_year))
+    trades_per_year = len(pnls) / years
+    return float((mean / std) * np.sqrt(trades_per_year))
 
 
 def _max_consecutive_losses(pnls: List[float]) -> int:
