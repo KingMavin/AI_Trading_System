@@ -20,7 +20,8 @@ from datetime import datetime
 from shared.indicators import (
     calculate_sma, calculate_ema, calculate_rsi,
     calculate_bbands, calculate_atr, calculate_adx,
-    calculate_volume_sma, calculate_session, calculate_regime
+    calculate_volume_sma, calculate_session, calculate_regime,
+    calculate_donchian_channel
 )
 
 
@@ -254,6 +255,16 @@ class Backtester:
         f['regime']     = calculate_regime(
             df, f['adx'], f['atr']
         )
+        
+        if 'channel_period' in self.params:
+            d_entry = calculate_donchian_channel(df, self.params['channel_period'])
+            f['donchian_upper_entry'] = d_entry['upper']
+            f['donchian_lower_entry'] = d_entry['lower']
+            
+            d_exit = calculate_donchian_channel(df, self.params['exit_period'])
+            f['donchian_upper_exit'] = d_exit['upper']
+            f['donchian_lower_exit'] = d_exit['lower']
+
         return f
 
     @staticmethod
@@ -285,6 +296,10 @@ class Backtester:
             'volume_rel':    self._clean_float(row.get('volume_rel'), 1.0),
             'session':       row['session'],
             'regime':        row['regime'],
+            'donchian_upper_entry': row.get('donchian_upper_entry'),
+            'donchian_lower_entry': row.get('donchian_lower_entry'),
+            'donchian_upper_exit':  row.get('donchian_upper_exit'),
+            'donchian_lower_exit':  row.get('donchian_lower_exit'),
         }
 
     def _simulated_spread(self, cache: Dict) -> float:

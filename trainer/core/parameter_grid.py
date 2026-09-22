@@ -50,10 +50,28 @@ DONCHIAN_BREAKOUT_SPACE = {
     'adx_threshold':    [0, 15, 20, 25, 30],
 }
 
+HYBRID_CONFLUENCE_SPACE = {
+    # Trend direction filter — slow MA only (no fast MA; entry is RSI-driven)
+    'slow_ma_period':  [30, 50, 80, 100],   # empirically dominant slow values
+    'ma_type':         ['SMA'],              # 100% of top-decile was SMA
+    # RSI pullback entry trigger
+    'rsi_period':      [14],                 # only value historically tested
+    'rsi_oversold':    [25, 30, 35],         # bounce-from threshold for BUY
+    'rsi_overbought':  [65, 70, 75],         # bounce-from threshold for SELL
+    # Trend strength confirmation
+    'adx_threshold':   [0, 20, 25],          # 20/25 dominated top-decile; 0 = control arm
+    # Risk parameters — narrow range to concentrate search on signal params
+    'sl_atr_multiple': [1.5, 2.0],           # 2.0 dominated 7/12 top sets
+    'tp_rr_ratio':     [2.0, 2.5],           # 2.0 dominated 7/12 top sets
+    # → Total: 4 × 1 × 1 × 3 × 3 × 3 × 2 × 2 = 432 combinations
+    # Constraint: rsi_oversold < rsi_overbought always satisfied (max 35 < min 65)
+}
+
 TEMPLATE_SPACES = {
-    'ma_crossover': MA_CROSSOVER_SPACE,
-    'rsi_reversion': RSI_REVERSION_SPACE,
+    'ma_crossover':      MA_CROSSOVER_SPACE,
+    'rsi_reversion':     RSI_REVERSION_SPACE,
     'donchian_breakout': DONCHIAN_BREAKOUT_SPACE,
+    'hybrid_confluence': HYBRID_CONFLUENCE_SPACE,
 }
 
 

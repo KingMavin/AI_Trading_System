@@ -1,0 +1,35 @@
+{
+  "bench_version": "1.0",
+  "updated_at": "2026-08-06T23:37:58.934430+00:00",
+  "active_strategy_id": "ATS-MA-MANUAL-001",
+  "strategies": [
+    {
+      "strategy_id": "ATS-MA-MANUAL-001",
+      "dna_hash": "7d1dc3c7d4e85ecf21a18aae4c4a31af6d46f4b8487574aecf2ba0c2d92abd99",
+      "status": "DEPLOYED",
+      "template": "ma_crossover",
+      "symbol": "EURUSD",
+      "composite_score": 1.25,
+      "promoted_at": "2026-05-27T00:00:00+00:00",
+      "promoted_by": "manual_test_stub",
+      "parameters": {
+        "fast_ma_period": 20,
+        "slow_ma_period": 100,
+        "ma_type": "SMA",
+        "sl_atr_multiple": 2.0,
+        "tp_rr_ratio": 2.0,
+        "risk_per_trade_pct": 0.5,
+        "pip_size": 0.0001,
+        "warmup_candles": 250,
+        "adx_min_threshold": 20,
+        "exit_on_opposite_crossover": false
+      },
+      "wf_summary": {
+        "median_win_rate": 0.55,
+        "median_profit_factor": 1.5,
+        "profitable_window_rate": 0.6
+      },
+      "notes": "Manual baseline strategy stub for testing."
+    }
+  ]
+}

@@ -35,6 +35,7 @@ from trainer.core.knowledge_base import KnowledgeBase
 import trainer.signals.ma_crossover as ma_crossover
 import trainer.signals.rsi_reversion as rsi_reversion
 import trainer.signals.donchian_breakout as donchian_breakout
+import trainer.signals.hybrid_confluence as hybrid_confluence
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,15 +47,16 @@ log = logging.getLogger(__name__)
 # ── DEFAULT CONFIGURATION ──────────────────────────────
 
 DEFAULT_TEMPLATE_TEST_MONTHS = {
-    'ma_crossover': 3,
-    'rsi_reversion': 2,
-    'donchian_breakout': 3
+    'ma_crossover':      3,
+    'rsi_reversion':     2,
+    'donchian_breakout': 3,
+    'hybrid_confluence': 3,
 }
 
 DEFAULT_CONFIG = {
-    'symbols':          ['EURUSD'],
-    'timeframe':        'M15',
-    'templates':        ['donchian_breakout'],
+    'symbols':          ['XAUUSD'],
+    'timeframe':        'H1',
+    'templates':        ['hybrid_confluence'],
     'opt_months':       6,
     'test_months':      None,
     'initial_equity':   10000.0,
@@ -505,6 +507,8 @@ class TrainerRunner:
                     signal_mod = rsi_reversion
                 elif candidate.template == 'donchian_breakout':
                     signal_mod = donchian_breakout
+                elif candidate.template == 'hybrid_confluence':
+                    signal_mod = hybrid_confluence
                 else:
                     signal_mod = ma_crossover
 
