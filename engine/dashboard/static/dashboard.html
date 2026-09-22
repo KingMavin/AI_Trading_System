@@ -1,0 +1,1320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Azrael — ATS Control Dashboard</title>
+<meta name="description" content="Local control dashboard for the Azrael Automated Trading System Engine and Trainer">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  /* ── DESIGN TOKENS ───────────────────────────────────── */
+  :root {
+    --bg-base:        #0d0f14;
+    --bg-panel:       #131720;
+    --bg-panel-2:     #1a1f2e;
+    --bg-input:       #0f1219;
+    --border:         #252a3a;
+    --border-bright:  #3a4260;
+    --text-primary:   #e8eaf0;
+    --text-secondary: #8892aa;
+    --text-muted:     #6c7a9c; /* Boosted contrast ratio >= 4.5:1 against #0d0f14 */
+    --accent:         #4f8ef7;
+    --accent-dim:     #2a4a8a;
+    --green:          #2dd4a2;
+    --green-dim:      #0d4035;
+    --amber:          #f0a040;
+    --amber-dim:      #4a3000;
+    --red:            #f04060;
+    --red-dim:        #4a0015;
+    --purple:         #a070f0;
+    --shadow:         0 4px 24px rgba(0,0,0,.5);
+    --radius:         10px;
+    --radius-sm:      6px;
+    --font-mono:      'JetBrains Mono', monospace;
+  }
+
+  /* ── RESET & BASE ─────────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html { font-size: 14px; }
+  body {
+    background: var(--bg-base);
+    color: var(--text-primary);
+    font-family: 'Inter', -apple-system, sans-serif;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  button { font-family: inherit; cursor: pointer; border: none; outline: none; }
+  input { font-family: inherit; outline: none; }
+
+  /* ── ACCESSIBILITY FOCUS RINGS ────────────────────────── */
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  /* ── LAYOUT ───────────────────────────────────────────── */
+  #app { display: flex; flex-direction: column; min-height: 100vh; }
+
+  /* Header */
+  #header {
+    display: flex; align-items: center; gap: 16px;
+    padding: 14px 24px;
+    background: var(--bg-panel);
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 100;
+  }
+  #header h1 { font-size: 1.05rem; font-weight: 600; letter-spacing: 0.03em; }
+  #header-logo {
+    width: 28px; height: 28px; border-radius: 6px;
+    background: linear-gradient(135deg, var(--accent), var(--purple));
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 0.8rem; color: #fff; flex-shrink: 0;
+  }
+  #header-subtitle { color: var(--text-muted); font-size: 0.8rem; flex: 1; }
+  #stale-banner {
+    display: none; align-items: center; gap: 8px;
+    background: var(--amber-dim); border: 1px solid var(--amber);
+    border-radius: var(--radius-sm); padding: 6px 14px;
+    color: var(--amber); font-size: 0.8rem; font-weight: 500;
+    animation: pulse 2s ease-in-out infinite;
+  }
+  #stale-banner.active { display: flex; }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.65; } }
+  #poll-indicator {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--text-muted); transition: background 0.3s;
+  }
+  #poll-indicator.active { background: var(--green); }
+
+  /* Nav tabs */
+  #nav {
+    display: flex; gap: 2px; padding: 0 24px;
+    background: var(--bg-panel); border-bottom: 1px solid var(--border);
+  }
+  .nav-tab {
+    padding: 10px 20px; font-size: 0.85rem; font-weight: 500;
+    color: var(--text-secondary); background: none; border: none;
+    border-bottom: 2px solid transparent; cursor: pointer;
+    transition: color 0.2s, border-color 0.2s;
+  }
+  .nav-tab:hover { color: var(--text-primary); }
+  .nav-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  /* Content panels */
+  #content { flex: 1; padding: 24px; max-width: 1400px; margin: 0 auto; width: 100%; }
+  .tab-panel { display: none; }
+  .tab-panel.active { display: block; }
+  .tab-panel:focus { outline: none; }
+
+  /* Grid */
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 16px; }
+  .grid-4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 16px; }
+  @media (max-width: 1100px) {
+    .grid-4 { grid-template-columns: 1fr 1fr; }
+    .grid-3 { grid-template-columns: 1fr 1fr; }
+  }
+  @media (max-width: 700px) {
+    .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
+  }
+
+  /* ── CARDS ────────────────────────────────────────────── */
+  .card {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+  }
+  .card-title {
+    font-size: 0.7rem; font-weight: 600; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--text-muted);
+    margin-bottom: 14px;
+  }
+  .card-header-flex {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 14px;
+  }
+  .card-header-flex .card-title { margin-bottom: 0; }
+  .card-action-btn {
+    padding: 4px 10px; border-radius: var(--radius-sm);
+    font-size: 0.75rem; font-weight: 500;
+    background: var(--bg-panel-2); color: var(--text-secondary);
+    border: 1px solid var(--border); cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .card-action-btn:hover { color: var(--text-primary); border-color: var(--border-bright); }
+  .card-scroll-box {
+    max-height: 520px; overflow-y: auto; padding-right: 4px;
+    scroll-behavior: smooth;
+  }
+  .card-scroll-box::-webkit-scrollbar { width: 6px; }
+  .card-scroll-box::-webkit-scrollbar-track { background: var(--bg-input); border-radius: 3px; }
+  .card-scroll-box::-webkit-scrollbar-thumb { background: var(--border-bright); border-radius: 3px; }
+  .card-value {
+    font-size: 1.6rem; font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+  .card-sub { font-size: 0.78rem; color: var(--text-secondary); margin-top: 4px; }
+
+  /* Status dot */
+  .dot {
+    display: inline-block; width: 8px; height: 8px;
+    border-radius: 50%; margin-right: 6px; flex-shrink: 0;
+    animation: none;
+  }
+  .dot.green  { background: var(--green);  box-shadow: 0 0 6px var(--green); }
+  .dot.amber  { background: var(--amber);  box-shadow: 0 0 6px var(--amber); animation: pulse 2s infinite; }
+  .dot.red    { background: var(--red);    box-shadow: 0 0 6px var(--red);   animation: pulse 1.5s infinite; }
+  .dot.grey   { background: var(--text-muted); }
+
+  /* Status badge */
+  .badge {
+    display: inline-flex; align-items: center;
+    padding: 3px 10px; border-radius: 100px;
+    font-size: 0.72rem; font-weight: 600; letter-spacing: 0.06em;
+  }
+  .badge.green  { background: var(--green-dim);  color: var(--green); }
+  .badge.amber  { background: var(--amber-dim);  color: var(--amber); }
+  .badge.red    { background: var(--red-dim);    color: var(--red); }
+  .badge.grey   { background: #1a1f2e; color: var(--text-muted); }
+  .badge.blue   { background: var(--accent-dim); color: var(--accent); }
+
+  /* ── ENGINE STATUS HERO ───────────────────────────────── */
+  #engine-hero {
+    display: flex; align-items: center; gap: 16px;
+    padding: 20px 24px;
+    background: var(--bg-panel-2); border: 1px solid var(--border);
+    border-radius: var(--radius); margin-bottom: 20px;
+  }
+  #engine-state-label {
+    font-size: 1.4rem; font-weight: 700;
+    transition: color 0.3s;
+  }
+  #engine-meta { flex: 1; }
+  #engine-pid-line { font-size: 0.78rem; color: var(--text-secondary); margin-top: 4px; font-family: var(--font-mono); }
+
+  /* ── KEY-VALUE TABLE ──────────────────────────────────── */
+  .kv-table { width: 100%; border-collapse: collapse; }
+  .kv-table tr + tr td { border-top: 1px solid var(--border); }
+  .kv-table td { padding: 7px 0; vertical-align: top; }
+  .kv-table td:first-child {
+    color: var(--text-muted); width: 45%; font-size: 0.78rem;
+    padding-right: 12px;
+  }
+  .kv-table td:last-child { font-family: var(--font-mono); font-size: 0.82rem; word-break: break-all; white-space: pre-wrap; }
+
+  /* ── LOG VIEWER ───────────────────────────────────────── */
+  #log-tabs { display: flex; gap: 4px; margin-bottom: 12px; }
+  .log-tab-btn {
+    padding: 6px 14px; border-radius: var(--radius-sm);
+    font-size: 0.78rem; font-weight: 500;
+    background: var(--bg-panel-2); color: var(--text-secondary);
+    border: 1px solid var(--border); cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+  .log-tab-btn:hover { color: var(--text-primary); }
+  .log-tab-btn.active { background: var(--accent-dim); color: var(--accent); border-color: var(--accent-dim); }
+  #log-box {
+    background: var(--bg-input); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); padding: 14px 16px;
+    height: 500px; overflow-y: auto;
+    font-family: var(--font-mono); font-size: 0.78rem;
+    line-height: 1.7; color: var(--text-secondary);
+    scroll-behavior: smooth;
+  }
+  #log-box .log-line { white-space: pre-wrap; word-break: break-all; }
+  #log-box .log-line.err { color: var(--red); }
+  #log-box .log-line.warn { color: var(--amber); }
+  #log-box .log-line.info { color: var(--text-secondary); }
+  #log-box .log-line.audit { color: var(--purple); }
+
+  /* ── COMMAND PANEL ────────────────────────────────────── */
+  .cmd-section { margin-bottom: 28px; }
+  .cmd-section-title {
+    font-size: 0.7rem; font-weight: 600; letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--text-muted);
+    margin-bottom: 12px; padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  .cmd-grid { display: flex; flex-wrap: wrap; gap: 10px; }
+  .cmd-btn {
+    padding: 9px 20px; border-radius: var(--radius-sm);
+    font-size: 0.82rem; font-weight: 600; letter-spacing: 0.03em;
+    transition: all 0.15s; border: 1px solid transparent;
+  }
+  .cmd-btn:hover { transform: translateY(-1px); box-shadow: var(--shadow); }
+  .cmd-btn:active { transform: translateY(0); }
+  .cmd-btn.tier1 { background: var(--accent-dim); color: var(--accent); border-color: var(--accent-dim); }
+  .cmd-btn.tier1:hover { background: var(--accent); color: #fff; }
+  .cmd-btn.tier2 { background: var(--amber-dim); color: var(--amber); border-color: var(--amber-dim); }
+  .cmd-btn.tier2:hover { background: rgba(240,160,64,.25); }
+  .cmd-btn.tier3 { background: var(--red-dim); color: var(--red); border-color: var(--red-dim); }
+  .cmd-btn.tier3:hover { background: rgba(240,64,96,.2); }
+  .cmd-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; box-shadow: none; }
+  .cmd-result {
+    margin-top: 10px; padding: 8px 14px;
+    border-radius: var(--radius-sm); font-size: 0.8rem;
+    font-family: var(--font-mono); display: none;
+  }
+  .cmd-result.ok  { background: var(--green-dim);  color: var(--green);  display: block; }
+  .cmd-result.err { background: var(--red-dim);    color: var(--red);    display: block; }
+
+  /* ── MODAL ────────────────────────────────────────────── */
+  .modal-backdrop {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,.7); z-index: 200;
+    align-items: center; justify-content: center;
+  }
+  .modal-backdrop.open { display: flex; }
+  .modal {
+    background: var(--bg-panel); border: 1px solid var(--border-bright);
+    border-radius: var(--radius); padding: 28px;
+    max-width: 500px; width: 90%; box-shadow: var(--shadow);
+    animation: modal-in 0.15s ease;
+  }
+  @keyframes modal-in { from { transform: scale(.95); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+  .modal-title { font-size: 1rem; font-weight: 600; margin-bottom: 8px; }
+  .modal-desc { font-size: 0.82rem; color: var(--text-secondary); margin-bottom: 16px; line-height: 1.6; }
+  .modal-info {
+    background: var(--bg-input); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); padding: 12px; margin-bottom: 16px;
+    font-family: var(--font-mono); font-size: 0.78rem; color: var(--text-secondary);
+  }
+  .modal-label { font-size: 0.78rem; color: var(--text-muted); margin-bottom: 6px; }
+  .modal-input {
+    width: 100%; padding: 9px 12px;
+    background: var(--bg-input); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); color: var(--text-primary);
+    font-size: 0.85rem; margin-bottom: 16px;
+    transition: border-color 0.15s;
+  }
+  .modal-input:focus { border-color: var(--accent); }
+  .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+  .modal-cancel {
+    padding: 8px 18px; border-radius: var(--radius-sm);
+    background: var(--bg-panel-2); color: var(--text-secondary);
+    border: 1px solid var(--border); font-size: 0.82rem;
+    cursor: pointer;
+  }
+  .modal-confirm {
+    padding: 8px 18px; border-radius: var(--radius-sm);
+    font-size: 0.82rem; font-weight: 600; cursor: pointer;
+    border: 1px solid transparent; transition: all 0.15s;
+  }
+  .modal-confirm.amber { background: var(--amber-dim); color: var(--amber); border-color: var(--amber-dim); }
+  .modal-confirm.amber:not(:disabled):hover { background: var(--amber); color: #000; }
+  .modal-confirm.red   { background: var(--red-dim);   color: var(--red);   border-color: var(--red-dim); }
+  .modal-confirm.red:not(:disabled):hover { background: var(--red); color: #fff; }
+  .modal-confirm:disabled { opacity: 0.35; cursor: not-allowed; }
+  .modal-phrase-hint { font-size: 0.72rem; color: var(--text-muted); margin-bottom: 6px; }
+  .modal-phrase-hint code {
+    font-family: var(--font-mono); color: var(--red);
+    background: var(--red-dim); padding: 1px 5px; border-radius: 3px;
+  }
+
+  /* ── MISC ─────────────────────────────────────────────── */
+  .section-gap { margin-bottom: 20px; }
+  .mono { font-family: var(--font-mono); }
+  .dim { color: var(--text-muted); }
+  .spinner { display: inline-block; width: 14px; height: 14px; }
+  .spinner::after {
+    content: ''; display: block; width: 14px; height: 14px;
+    border: 2px solid var(--border); border-top-color: var(--accent);
+    border-radius: 50%; animation: spin 0.6s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ── HEADER ──────────────────────────────────────────── -->
+  <header id="header">
+    <div id="header-logo" aria-hidden="true">AZ</div>
+    <div>
+      <h1>Azrael Dashboard</h1>
+      <div id="header-subtitle">ATS Engine &amp; Trainer Control — localhost only</div>
+    </div>
+    <div id="stale-banner" role="alert">
+      ⚠ ENGINE DATA STALE — <span id="stale-since"></span>
+    </div>
+    <div id="poll-indicator" title="Polling active" aria-label="Polling active indicator"></div>
+  </header>
+
+  <!-- ── NAV ─────────────────────────────────────────────── -->
+  <nav id="nav" role="tablist" aria-label="Main Navigation">
+    <button class="nav-tab active" role="tab" aria-selected="true" aria-controls="panel-overview" data-tab="overview" id="tab-overview">Overview</button>
+    <button class="nav-tab" role="tab" aria-selected="false" aria-controls="panel-logs" data-tab="logs" id="tab-logs">Logs</button>
+    <button class="nav-tab" role="tab" aria-selected="false" aria-controls="panel-commands" data-tab="commands" id="tab-commands">Commands</button>
+    <button class="nav-tab" role="tab" aria-selected="false" aria-controls="panel-strategy" data-tab="strategy" id="tab-strategy">Strategy</button>
+    <button class="nav-tab" role="tab" aria-selected="false" aria-controls="panel-adaptation" data-tab="adaptation" id="tab-adaptation">Adaptation View</button>
+    <button class="nav-tab" role="tab" aria-selected="false" aria-controls="panel-bench" data-tab="bench" id="tab-bench">Strategy Bench</button>
+  </nav>
+
+  <!-- ── CONTENT ─────────────────────────────────────────── -->
+  <main id="content">
+
+    <!-- ═══ OVERVIEW TAB ════════════════════════════════════ -->
+    <div class="tab-panel active" role="tabpanel" tabindex="0" aria-labelledby="tab-overview" id="panel-overview">
+
+      <!-- Engine Hero -->
+      <div id="engine-hero">
+        <span class="dot grey" id="engine-dot" aria-hidden="true"></span>
+        <div id="engine-meta">
+          <div id="engine-state-label">—</div>
+          <div id="engine-pid-line">—</div>
+        </div>
+        <span id="engine-badge" class="badge grey">UNKNOWN</span>
+      </div>
+
+      <!-- Top stat cards -->
+      <div class="grid-4 section-gap">
+        <div class="card">
+          <div class="card-title">Win Rate (recent 50)</div>
+          <div class="card-value" id="stat-wr">—</div>
+          <div class="card-sub" id="stat-trades">— trades</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Total P&amp;L (recent 50)</div>
+          <div class="card-value" id="stat-pnl">—</div>
+          <div class="card-sub">recent 50 trades</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Profit Factor</div>
+          <div class="card-value" id="stat-pf">—</div>
+          <div class="card-sub">gross profit / gross loss</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Account Equity</div>
+          <div class="card-value" id="stat-equity">—</div>
+          <div class="card-sub" id="stat-session">—</div>
+        </div>
+      </div>
+
+      <!-- Middle row -->
+      <div class="grid-2 section-gap">
+        <!-- Engine state -->
+        <div class="card">
+          <div class="card-title">Engine State</div>
+          <table class="kv-table" id="engine-kv"></table>
+        </div>
+
+        <!-- CUSUM -->
+        <div class="card">
+          <div class="card-title">CUSUM Degradation Monitor</div>
+          <table class="kv-table" id="cusum-kv"></table>
+        </div>
+      </div>
+
+      <!-- Bottom row -->
+      <div class="grid-2 section-gap">
+        <!-- Degradation -->
+        <div class="card">
+          <div class="card-title">Degradation Monitor</div>
+          <table class="kv-table" id="degradation-kv"></table>
+        </div>
+        <!-- Trainer -->
+        <div class="card">
+          <div class="card-title">Trainer</div>
+          <table class="kv-table" id="trainer-kv"></table>
+        </div>
+      </div>
+
+      <!-- Pre-Trade Checklist Panel 6 -->
+      <div class="card section-gap">
+        <div class="card-header-flex">
+          <div class="card-title">Pre-Trade Checklist — 9-Item Verification Grid (PRD §3.2 &amp; Panel 6)</div>
+          <span class="badge grey" id="checklist-overall-badge">NO EVALUATION</span>
+        </div>
+        <div class="card-scroll-box">
+          <table class="trades-table" id="checklist-table">
+            <thead>
+              <tr><th>#</th><th>Checklist Item</th><th>Status</th><th>Evaluation Detail</th></tr>
+            </thead>
+            <tbody id="checklist-rows">
+              <tr><td colspan="4" class="dim">Waiting for candle evaluation…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ LOGS TAB ══════════════════════════════════════════ -->
+    <div class="tab-panel" role="tabpanel" tabindex="0" aria-labelledby="tab-logs" id="panel-logs">
+      <div class="card" style="padding: 16px 20px;">
+        <div id="log-tabs" role="tablist" aria-label="Log sources">
+          <button class="log-tab-btn active" role="tab" aria-selected="true" data-logsrc="engine">Engine Log</button>
+          <button class="log-tab-btn" role="tab" aria-selected="false" data-logsrc="trades">Trades</button>
+          <button class="log-tab-btn" role="tab" aria-selected="false" data-logsrc="audit">Audit Ledger</button>
+          <button class="log-tab-btn" role="tab" aria-selected="false" data-logsrc="trainer">Trainer Output</button>
+          <select id="log-date-select" class="log-tab-btn" style="padding: 4px 8px; font-family: inherit;" aria-label="Select log date">
+            <option value="">Today (Live)</option>
+          </select>
+          <div style="margin-left:auto; display:flex; gap:6px;">
+            <button class="log-tab-btn" id="log-copy-btn" data-logsrc="" aria-label="Copy logs">📋 Copy Logs</button>
+            <button class="log-tab-btn" id="log-refresh-btn" data-logsrc="" aria-label="Refresh logs">↻ Refresh</button>
+          </div>
+        </div>
+        <div id="log-box" role="region" aria-label="Log Output" aria-live="polite"><span class="dim">Loading…</span></div>
+      </div>
+    </div>
+
+    <!-- ═══ COMMANDS TAB ══════════════════════════════════════ -->
+    <div class="tab-panel" role="tabpanel" tabindex="0" aria-labelledby="tab-commands" id="panel-commands">
+
+      <!-- Engine -->
+      <div class="cmd-section">
+        <h2 class="cmd-section-title">⚙ Engine — Tier 1 (Safe, 1-click)</h2>
+        <div class="cmd-grid">
+          <button class="cmd-btn tier1" id="cmd-start">▶ Start Engine</button>
+          <button class="cmd-btn tier1" id="cmd-reload">↻ Reload Strategy</button>
+        </div>
+        <div class="cmd-result" id="result-reload" role="status"></div>
+      </div>
+
+      <div class="cmd-section">
+        <h2 class="cmd-section-title">⚙ Engine — Tier 2 (Modal + Audit Log)</h2>
+        <div class="cmd-grid">
+          <button class="cmd-btn tier2" id="cmd-stop">⏹ Graceful Stop</button>
+          <button class="cmd-btn tier2" id="cmd-restart">↺ Graceful Restart</button>
+          <button class="cmd-btn tier2" id="cmd-clear-safe-mode">🔓 Clear SAFE_MODE</button>
+          <button class="cmd-btn tier2" id="cmd-trainer-stop">⏹ Stop Trainer</button>
+        </div>
+        <div class="cmd-result" id="result-tier2" role="status"></div>
+      </div>
+
+      <div class="cmd-section">
+        <h2 class="cmd-section-title">🚨 Engine — Tier 3 (Hard Kill — typed confirmation required)</h2>
+        <div class="cmd-grid">
+          <button class="cmd-btn tier3" id="cmd-kill">☠ HARD KILL ENGINE</button>
+        </div>
+        <div class="cmd-result" id="result-tier3" role="status"></div>
+      </div>
+
+      <!-- Trainer -->
+      <div class="cmd-section">
+        <h2 class="cmd-section-title">🧠 Trainer — Tier 1</h2>
+        <div class="cmd-grid">
+          <button class="cmd-btn tier1" id="cmd-trainer-run">▶ Run Trainer (Full)</button>
+          <button class="cmd-btn tier1" id="cmd-trainer-quick">⚡ Run Trainer (Quick)</button>
+        </div>
+        <div class="cmd-result" id="result-trainer" role="status"></div>
+      </div>
+
+    </div>
+
+    <!-- ═══ STRATEGY TAB ════════════════════════════════════ -->
+    <div class="tab-panel" role="tabpanel" tabindex="0" aria-labelledby="tab-strategy" id="panel-strategy">
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-header-flex">
+            <div class="card-title">Active Strategy</div>
+            <button class="card-action-btn" id="strategy-copy-btn" aria-label="Copy active strategy">📋 Copy Strategy</button>
+          </div>
+          <div class="card-scroll-box">
+            <table class="kv-table" id="strategy-kv"></table>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-header-flex">
+            <div class="card-title">Last Trainer Decision</div>
+            <button class="card-action-btn" id="decision-copy-btn" aria-label="Copy last trainer decision">📋 Copy Decision</button>
+          </div>
+          <div class="card-scroll-box">
+            <table class="kv-table" id="decision-kv"></table>
+          </div>
+        </div>
+      </div>
+    <!-- ═══ ADAPTATION VIEW TAB ═════════════════════════════ -->
+    <div class="tab-panel" role="tabpanel" tabindex="0" aria-labelledby="tab-adaptation" id="panel-adaptation">
+      <div class="card section-gap">
+        <div class="card-header-flex">
+          <div class="card-title">Latest Candidate Adaptation &amp; Decision</div>
+          <span class="badge grey" id="adapt-badge">NO DECISION</span>
+        </div>
+        <div id="adapt-hero-text" class="dim">Loading adaptation decision data…</div>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-title">Parameter Differences (Active vs Candidate)</div>
+          <div class="card-scroll-box">
+            <table class="trades-table" id="adapt-params-table">
+              <thead>
+                <tr><th>Parameter</th><th>Active Strategy</th><th>Candidate Strategy</th></tr>
+              </thead>
+              <tbody id="adapt-params-rows"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">10-Gate Performance Inspection</div>
+          <div class="card-scroll-box">
+            <table class="trades-table" id="adapt-gates-table">
+              <thead>
+                <tr><th>Gate</th><th>Metric Value</th><th>Threshold</th><th>Status</th></tr>
+              </thead>
+              <tbody id="adapt-gates-rows"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ STRATEGY BENCH TAB ═══════════════════════════════ -->
+    <div class="tab-panel" role="tabpanel" tabindex="0" aria-labelledby="tab-bench" id="panel-bench">
+      <div class="card section-gap">
+        <div class="card-header-flex">
+          <div class="card-title">Strategy Bench — Lifecycle Management</div>
+          <button class="card-action-btn" id="bench-refresh-btn">↻ Refresh Bench</button>
+        </div>
+        <div style="font-size:0.8rem; color:var(--text-muted);">
+          Staged and approved candidates ready for deployment. Auto-promote candidates land here first — explicit deploy required.
+        </div>
+      </div>
+
+      <div id="bench-container">
+        <div class="dim">Loading strategy bench…</div>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<!-- ── MODAL: Tier 2 ──────────────────────────────────── -->
+<div class="modal-backdrop" id="modal-t2" role="dialog" aria-modal="true" aria-labelledby="modal-t2-title" aria-describedby="modal-t2-desc">
+  <div class="modal">
+    <h2 class="modal-title" id="modal-t2-title">Confirm Action</h2>
+    <div class="modal-desc" id="modal-t2-desc">This action will be logged to the audit ledger.</div>
+    <div class="modal-info" id="modal-t2-info" style="display:none"></div>
+    <label class="modal-label" htmlFor="modal-t2-reason">Reason <span style="color:var(--red)" aria-hidden="true">*</span></label>
+    <input class="modal-input" id="modal-t2-reason" type="text" placeholder="Enter reason for audit log…" autocomplete="off" required>
+    <div class="modal-actions">
+      <button class="modal-cancel" id="modal-t2-cancel">Cancel</button>
+      <button class="modal-confirm amber" id="modal-t2-confirm" disabled>Confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── MODAL: Tier 3 Hard Kill ───────────────────────── -->
+<div class="modal-backdrop" id="modal-t3" role="dialog" aria-modal="true" aria-labelledby="modal-t3-title" aria-describedby="modal-t3-desc">
+  <div class="modal">
+    <h2 class="modal-title" id="modal-t3-title" style="color: var(--red)">☠ Hard Kill — Engine</h2>
+    <div class="modal-desc" id="modal-t3-desc">
+      This sends <strong>TerminateProcess()</strong> — the Engine is forcibly terminated with no cleanup.
+      Open positions are <strong>NOT closed</strong> — broker-side SL/TP handles risk.
+      This action is logged to the audit ledger before execution.
+    </div>
+    <div class="modal-info" id="modal-t3-info"></div>
+    <label class="modal-label" htmlFor="modal-t3-reason">Reason (for audit log)</label>
+    <input class="modal-input" id="modal-t3-reason" type="text" placeholder="Reason for hard kill…" autocomplete="off">
+    <div class="modal-phrase-hint">Type exactly: <code id="kill-phrase-display">KILL AZRAEL ENGINE</code></div>
+    <label class="modal-label" htmlFor="modal-t3-phrase" style="display:none">Confirmation Phrase</label>
+    <input class="modal-input" id="modal-t3-phrase" type="text"
+           placeholder="Type confirmation phrase…" autocomplete="off" spellcheck="false">
+    <div class="modal-actions">
+      <button class="modal-cancel" id="modal-t3-cancel">Cancel</button>
+      <button class="modal-confirm red" id="modal-t3-confirm" disabled>Hard Kill</button>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+// ── CONFIG ───────────────────────────────────────────────
+const POLL_INTERVAL_MS  = 3000;
+const LOG_INTERVAL_MS   = 5000;
+const STALE_THRESHOLD_S = 30;
+const KILL_PHRASE       = "KILL AZRAEL ENGINE";
+const API               = (path) => path;
+
+// ── STATE ─────────────────────────────────────────────────
+let lastStatus       = null;
+let lastUpdatedAt    = null;
+let currentLogSrc    = 'engine';
+let pendingT2Action  = null;
+
+// ── UTILS ─────────────────────────────────────────────────
+const $  = (id) => document.getElementById(id);
+const el = (tag, cls, txt) => { const e = document.createElement(tag); if (cls) e.className = cls; if (txt !== undefined) e.textContent = txt; return e; };
+const fmt_pct = (v) => v == null ? '—' : (v * 100).toFixed(1) + '%';
+const fmt_num = (v, dp=2) => v == null ? '—' : Number(v).toFixed(dp);
+const fmt_ts  = (s) => { if (!s) return '—'; try { return new Date(s).toLocaleTimeString(); } catch { return s; } };
+const fmt_ts_full = (s) => { if (!s) return '—'; try { return new Date(s).toLocaleString(); } catch { return s; } };
+
+function copyToClipboard(text, btnEl, originalText) {
+  if (!text) return;
+  function onSuccess() {
+    if (!btnEl) return;
+    btnEl.textContent = '✓ Copied!';
+    setTimeout(() => { btnEl.textContent = originalText; }, 2000);
+  }
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text).then(onSuccess).catch(fallback);
+  } else {
+    fallback();
+  }
+  function fallback() {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+      onSuccess();
+    } catch (e) {
+      console.error('Copy failed:', e);
+    }
+  }
+}
+
+function kv_rows(tableId, rows) {
+  const t = $(tableId);
+  t.innerHTML = '';
+  rows.forEach(([k, v]) => {
+    const tr = document.createElement('tr');
+    const td1 = document.createElement('td'); td1.textContent = k;
+    const td2 = document.createElement('td');
+    if (v && typeof v === 'object' && v._html) {
+      td2.innerHTML = v._html;
+    } else {
+      td2.textContent = (v === null || v === undefined) ? '—' : String(v);
+    }
+    tr.appendChild(td1); tr.appendChild(td2); t.appendChild(tr);
+  });
+}
+
+function badge(text, cls) {
+  return { _html: `<span class="badge ${cls}">${text}</span>` };
+}
+
+function dot_badge(ok, okText, nokText) {
+  return ok ? badge(okText, 'green') : badge(nokText, 'red');
+}
+
+// ── STATUS RENDER ─────────────────────────────────────────
+function render(s) {
+  lastStatus = s;
+
+  // Hero
+  const eng = s.engine;
+  const running = eng.running;
+  const safeMode = eng.safe_mode;
+  const cb = eng.circuit_breaker;
+  const cusum = s.cusum;
+
+  let dotCls, stateLbl, badgeText, badgeCls;
+  if (!running) {
+    dotCls = 'grey'; stateLbl = 'ENGINE STOPPED'; badgeText = 'STOPPED'; badgeCls = 'grey';
+  } else if (safeMode || cb) {
+    dotCls = 'red'; stateLbl = 'SAFE_MODE / DEGRADED'; badgeText = 'DEGRADED'; badgeCls = 'red';
+  } else if (cusum.tripped) {
+    dotCls = 'amber'; stateLbl = 'CUSUM TRIPPED'; badgeText = 'CUSUM TRIP'; badgeCls = 'amber';
+  } else {
+    dotCls = 'green'; stateLbl = 'RUNNING'; badgeText = 'RUNNING'; badgeCls = 'green';
+  }
+
+  const dotEl = $('engine-dot');
+  dotEl.className = 'dot ' + dotCls;
+  $('engine-state-label').textContent = stateLbl;
+  $('engine-state-label').style.color = dotCls === 'green' ? 'var(--green)' : dotCls === 'red' ? 'var(--red)' : dotCls === 'amber' ? 'var(--amber)' : 'var(--text-muted)';
+  $('engine-pid-line').textContent = running
+    ? `PID ${eng.pid}  ·  ${eng.symbol}  ·  started ${fmt_ts_full(eng.started_at)}`
+    : 'Not running';
+  $('engine-badge').className = 'badge ' + badgeCls;
+  $('engine-badge').textContent = badgeText;
+
+  // Stat cards
+  const perf = s.performance;
+  $('stat-wr').textContent    = fmt_pct(perf.win_rate);
+  $('stat-wr').style.color    = perf.win_rate >= 0.5 ? 'var(--green)' : 'var(--red)';
+  $('stat-trades').textContent = `${perf.total_trades} total / ${perf.recent_trades} recent`;
+  $('stat-pnl').textContent   = (perf.total_pnl >= 0 ? '+' : '') + fmt_num(perf.total_pnl);
+  $('stat-pnl').style.color   = perf.total_pnl >= 0 ? 'var(--green)' : 'var(--red)';
+  $('stat-pf').textContent    = fmt_num(perf.profit_factor, 3);
+  $('stat-pf').style.color    = perf.profit_factor >= 1 ? 'var(--green)' : 'var(--red)';
+  $('stat-equity').textContent = eng.equity ? fmt_num(eng.equity, 2) : '—';
+  $('stat-session').textContent = `${eng.session || '—'} / ${eng.regime || '—'}`;
+
+  // Engine KV
+  kv_rows('engine-kv', [
+    ['State',           badge(stateLbl, badgeCls)],
+    ['SAFE_MODE',       dot_badge(!safeMode, 'OK', 'ACTIVE')],
+    ['Circuit Breaker', dot_badge(!cb, 'OK', 'TRIPPED')],
+    ['MT5 Algo Trading', eng.algo_trading_on == null ? badge('UNKNOWN', 'grey') : dot_badge(eng.algo_trading_on, 'ENABLED', 'DISABLED')],
+    ['Open Position',   eng.open_position ? JSON.stringify(eng.open_position) : 'None'],
+    ['Last Update',     fmt_ts(eng.updated_at)],
+  ]);
+
+  // CUSUM KV
+  kv_rows('cusum-kv', [
+    ['Status',       cusum.tripped ? badge('TRIPPED', 'red') : badge('OK', 'green')],
+    ['Trip Reason',  cusum.reason || '—'],
+    ['Score s_i',    fmt_num(cusum.s_i, 4)],
+    ['Threshold h',  fmt_num(cusum.h, 4)],
+    ['Baseline p0',  fmt_pct(cusum.p0)],
+    ['Live Win Rate', fmt_pct(cusum.win_rate)],
+    ['N Trades',     cusum.n_trades],
+  ]);
+
+  // Degradation KV
+  const deg = s.degradation;
+  kv_rows('degradation-kv', [
+    ['Status',          deg.status === 'OK' ? badge('OK', 'green') : badge(deg.status, 'amber')],
+    ['Alert Count',     deg.alert_count],
+    ['Rolling PF',      fmt_num(deg.rolling_pf, 3)],
+    ['Rolling Win Rate',fmt_pct(deg.rolling_wr)],
+    ['Loss Streak',     deg.loss_streak],
+    ['Rerun Recommended', deg.rerun_recommended ? badge('YES', 'amber') : badge('No', 'grey')],
+  ]);
+
+  // Trainer KV
+  const tr = s.trainer;
+  const trRunning = tr.running;
+  const lastRes = tr.last_result;
+  kv_rows('trainer-kv', [
+    ['Status',      trRunning ? badge('RUNNING', 'blue') : badge('IDLE', 'grey')],
+    ['PID',         tr.pid || '—'],
+    ['Progress',    tr.progress_pct != null ? `${tr.progress_pct}% (Window ${tr.current_window || '—'}/${tr.total_windows || '—'})` : (trRunning ? 'In Progress…' : '—')],
+    ['Last Run',    lastRes ? (lastRes.success ? badge('PASSED', 'green') : badge('FAILED', 'red')) : '—'],
+    ['Finished At', lastRes ? fmt_ts_full(lastRes.finished_at) : '—'],
+    ['Last Decision', tr.last_decision ? (tr.last_decision.decision || '—') : '—'],
+  ]);
+
+  // Part E Mutual Exclusion Controls
+  const btnStart = $('cmd-start');
+  const btnRestart = $('cmd-restart');
+  const btnClear = $('cmd-clear-safe-mode');
+  const btnTrainerRun = $('cmd-trainer-run');
+  const btnTrainerQuick = $('cmd-trainer-quick');
+
+  if (trRunning) {
+    if (btnStart) { btnStart.disabled = true; btnStart.title = "Trainer active — stop Trainer first"; }
+    if (btnRestart) { btnRestart.disabled = true; btnRestart.title = "Trainer active — stop Trainer first"; }
+    if (btnClear) { btnClear.disabled = true; btnClear.title = "Trainer active — stop Trainer first"; }
+  } else {
+    if (btnStart) { btnStart.disabled = false; btnStart.title = ""; }
+    if (btnRestart) { btnRestart.disabled = false; btnRestart.title = ""; }
+    if (btnClear) { btnClear.disabled = false; btnClear.title = ""; }
+  }
+
+  if (running) {
+    if (btnTrainerRun) { btnTrainerRun.disabled = true; btnTrainerRun.title = "Engine running live — stop Engine first"; }
+    if (btnTrainerQuick) { btnTrainerQuick.disabled = true; btnTrainerQuick.title = "Engine running live — stop Engine first"; }
+  } else {
+    if (btnTrainerRun) { btnTrainerRun.disabled = false; btnTrainerRun.title = ""; }
+    if (btnTrainerQuick) { btnTrainerQuick.disabled = false; btnTrainerQuick.title = ""; }
+  }
+
+  // Strategy tab (always update in background)
+  const str = s.strategy;
+  const dnaTrunc = str.dna_hash ? str.dna_hash.substring(0, 8) : '—';
+  kv_rows('strategy-kv', [
+    ['Strategy ID',   str.id],
+    ['DNA Hash',      { _html: `<span class="badge blue mono" title="${str.dna_hash || ''}">DNA: ${dnaTrunc}</span>` }],
+    ['Template',      str.template],
+    ['Score',         fmt_num(str.score, 4)],
+    ['Promoted At',   fmt_ts_full(str.promoted_at)],
+    ...Object.entries(str.parameters || {}).map(([k,v]) => [k, String(v)]),
+  ]);
+
+  // Pre-Trade Checklist Panel 6 rendering
+  const chk = eng.checklist;
+  const chkBadge = $('checklist-overall-badge');
+  const chkRows = $('checklist-rows');
+
+  if (chk && chk.items) {
+    if (chkBadge) {
+      chkBadge.className = 'badge ' + (chk.all_passed ? 'green' : 'red');
+      chkBadge.textContent = chk.all_passed ? '✓ ALL 9 ITEMS PASSED' : `✕ BLOCKED (${chk.first_failure_reason || 'Checklist failed'})`;
+    }
+    if (chkRows) {
+      chkRows.innerHTML = '';
+      Object.values(chk.items).sort((a,b) => a.item_id - b.item_id).forEach(item => {
+        const tr = document.createElement('tr');
+        const td1 = document.createElement('td'); td1.textContent = `#${item.item_id}`;
+        const td2 = document.createElement('td'); td2.textContent = item.name;
+        const td3 = document.createElement('td');
+        td3.innerHTML = `<span class="badge ${item.pass ? 'green' : 'red'}">${item.pass ? 'PASS' : 'FAIL'}</span>`;
+        const td4 = document.createElement('td'); td4.textContent = item.detail;
+        tr.appendChild(td1); tr.appendChild(td2); tr.appendChild(td3); tr.appendChild(td4);
+        chkRows.appendChild(tr);
+      });
+    }
+  } else {
+    if (chkBadge) {
+      chkBadge.className = 'badge grey';
+      chkBadge.textContent = 'NO EVALUATION';
+    }
+    if (chkRows) {
+      chkRows.innerHTML = '<tr><td colspan="4" class="dim">Waiting for candle evaluation…</td></tr>';
+    }
+  }
+
+  const dec = tr.last_decision;
+  if (dec) {
+    kv_rows('decision-kv', Object.entries(dec).map(([k,v]) => [k, typeof v === 'object' ? JSON.stringify(v) : String(v)]));
+  } else {
+    kv_rows('decision-kv', [['No decisions yet', '']]);
+  }
+
+  // Stale banner
+  if (lastUpdatedAt) {
+    const ageS = (Date.now() - lastUpdatedAt) / 1000;
+    if (ageS > STALE_THRESHOLD_S) {
+      $('stale-banner').classList.add('active');
+      $('stale-since').textContent = `last update ${Math.round(ageS)}s ago`;
+    } else {
+      $('stale-banner').classList.remove('active');
+    }
+  }
+}
+
+// ── POLL STATUS ───────────────────────────────────────────
+async function pollStatus() {
+  $('poll-indicator').classList.add('active');
+  try {
+    const r = await fetch(API('/api/status'));
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    lastUpdatedAt = Date.now();
+    render(data);
+  } catch (e) {
+    console.warn('Status poll failed:', e);
+  } finally {
+    $('poll-indicator').classList.remove('active');
+  }
+}
+
+// ── LOG LOADING & HISTORY ARCHIVAL ──────────────────────
+async function loadLogDates() {
+  const dateSel = $('log-date-select');
+  if (!dateSel) return;
+  try {
+    const r = await fetch(API('/api/logs/dates'));
+    if (!r.ok) return;
+    const data = await r.json();
+    const dates = data.dates || [];
+    const currVal = dateSel.value;
+    dateSel.innerHTML = '';
+    dates.forEach(d => {
+      const opt = document.createElement('option');
+      opt.value = d.date;
+      opt.textContent = d.display;
+      if (d.date === currVal) opt.selected = true;
+      dateSel.appendChild(opt);
+    });
+  } catch (e) {
+    console.warn('Log dates fetch failed:', e);
+  }
+}
+
+async function loadLogs(src, date = null) {
+  const box = $('log-box');
+  box.innerHTML = '<span class="dim">Loading…</span>';
+  const dateSel = $('log-date-select');
+  const selDate = date || (dateSel ? dateSel.value : '');
+  try {
+    const url = API(`/api/logs/${src}?n=200${selDate ? '&date=' + encodeURIComponent(selDate) : ''}`);
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const data = await r.json();
+    const lines = data.lines || [];
+    if (!lines.length) { box.innerHTML = '<span class="dim">No log lines found.</span>'; return; }
+    box.innerHTML = lines.map(l => {
+      let cls = 'info';
+      if (/error|exception|traceback/i.test(l)) cls = 'err';
+      else if (/warning|warn/i.test(l)) cls = 'warn';
+      else if (src === 'audit') cls = 'audit';
+      return `<div class="log-line ${cls}">${escHtml(l)}</div>`;
+    }).join('');
+    box.scrollTop = box.scrollHeight;
+  } catch (e) {
+    box.innerHTML = `<span class="dim">Error loading logs: ${escHtml(String(e))}</span>`;
+  }
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── ADAPTATION & BENCH LOADERS (WAVE 19) ───────────────
+async function fetchAdaptation() {
+  try {
+    const r = await fetch(API('/api/adaptation/latest'));
+    if (!r.ok) return;
+    const data = await r.json();
+    if (!data.has_decision) {
+      $('adapt-badge').className = 'badge grey';
+      $('adapt-badge').textContent = 'NO DECISION';
+      $('adapt-hero-text').textContent = data.message || 'No decision log entries found.';
+      return;
+    }
+    const dec = data.decision;
+    const outcome = dec.decision_outcome || 'UNKNOWN';
+    let badgeCls = 'grey';
+    if (outcome === 'PROMOTED') badgeCls = 'green';
+    else if (outcome === 'FLAGGED') badgeCls = 'amber';
+    else if (outcome === 'REJECTED') badgeCls = 'red';
+
+    $('adapt-badge').className = 'badge ' + badgeCls;
+    $('adapt-badge').textContent = outcome;
+
+    $('adapt-hero-text').innerHTML = `
+      <strong>Candidate:</strong> <code>${escHtml(dec.candidate_id || '—')}</code> | 
+      <strong>Composite Score:</strong> ${fmt_num(dec.composite_score)} vs Baseline ${fmt_num(dec.baseline_score)} 
+      (${dec.improvement_pct != null ? '+' + dec.improvement_pct.toFixed(1) + '%' : 'N/A'}) | 
+      <strong>Path:</strong> ${escHtml(dec.decision_path || '—')} | 
+      <strong>Date:</strong> ${fmt_ts_full(dec.decided_at)}
+    `;
+
+    // Render Parameter Diff
+    const pRows = (data.parameter_diff || []).map(p => `
+      <tr style="${p.changed ? 'background:rgba(76,175,80,0.08); font-weight:600;' : ''}">
+        <td><code>${escHtml(p.parameter)}</code></td>
+        <td>${escHtml(String(p.active_value))}</td>
+        <td>${escHtml(String(p.candidate_value))} ${p.changed ? '★' : ''}</td>
+      </tr>
+    `).join('');
+    $('adapt-params-rows').innerHTML = pRows || '<tr><td colspan="3" class="dim">No parameter diffs.</td></tr>';
+
+    // Render 10-Gate Inspection
+    const gRows = (data.gate_breakdown || []).map(g => `
+      <tr>
+        <td><strong>${escHtml(g.gate)}</strong></td>
+        <td><code>${escHtml(String(g.metric_value))}</code></td>
+        <td><code>${escHtml(g.threshold)}</code></td>
+        <td><span class="badge ${g.passed ? 'green' : 'red'}">${g.passed ? 'PASS' : 'FAIL'}</span></td>
+      </tr>
+    `).join('');
+    $('adapt-gates-rows').innerHTML = gRows || '<tr><td colspan="4" class="dim">No gate breakdown data.</td></tr>';
+
+  } catch (e) {
+    console.warn('Adaptation fetch failed:', e);
+  }
+}
+
+async function fetchBench() {
+  try {
+    const r = await fetch(API('/api/bench'));
+    if (!r.ok) return;
+    const data = await r.json();
+    const strats = data.strategies || [];
+    if (!strats.length) {
+      $('bench-container').innerHTML = '<div class="card dim">Strategy bench is empty.</div>';
+      return;
+    }
+
+    const html = strats.map(s => {
+      const isStub = s.promoted_by === 'manual_test_stub';
+      const isDeployed = s.status === 'DEPLOYED';
+      let badgeCls = 'blue';
+      if (isDeployed) badgeCls = 'green';
+      else if (s.status === 'ARCHIVED') badgeCls = 'grey';
+      else if (s.status === 'REJECTED') badgeCls = 'red';
+
+      return `
+        <div class="card section-gap" style="${isDeployed ? 'border-left: 4px solid var(--green);' : ''}">
+          <div class="card-header-flex">
+            <div>
+              <strong style="font-size:1rem;"><code>${escHtml(s.strategy_id)}</code></strong>
+              <span class="badge ${badgeCls}" style="margin-left:8px;">${escHtml(s.status)}</span>
+              ${isStub ? '<span class="badge amber" style="margin-left:6px;">⚠️ Test Stub (Manual Baseline)</span>' : ''}
+            </div>
+            ${!isDeployed ? `<button class="card-action-btn bench-deploy-btn" data-stratid="${escHtml(s.strategy_id)}">🚀 Deploy to Engine</button>` : '<span class="badge green">✓ ACTIVE DEPLOYED</span>'}
+          </div>
+          <div style="font-size:0.82rem; color:var(--text-secondary); margin-bottom:10px;">
+            <strong>Template:</strong> ${escHtml(s.template || '—')} | 
+            <strong>Symbol:</strong> ${escHtml(s.symbol || '—')} | 
+            <strong>Composite Score:</strong> ${fmt_num(s.composite_score)} | 
+            <strong>Promoted By:</strong> ${escHtml(s.promoted_by || '—')}
+          </div>
+          <div class="card-scroll-box" style="max-height:160px; background:var(--bg-input); padding:8px 12px; border-radius:var(--radius-sm);">
+            <pre style="font-size:0.75rem; margin:0; font-family:var(--font-mono);">${escHtml(JSON.stringify(s.parameters || {}, null, 2))}</pre>
+          </div>
+        </div>
+      `;
+    }).join('');
+
+    $('bench-container').innerHTML = html;
+
+    // Attach Deploy Click Handlers
+    document.querySelectorAll('.bench-deploy-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const stratId = btn.dataset.stratid;
+        if (!confirm(`Deploy strategy '${stratId}' to Engine? This will update active_strategy.json and restart Engine.`)) return;
+        btn.disabled = True;
+        btn.textContent = 'Deploying…';
+        const res = await apiPost('/api/bench/deploy', { strategy_id: stratId });
+        alert(res.data.message || (res.ok ? 'Deployed successfully' : 'Deployment failed'));
+        fetchBench();
+        fetchStatus();
+      });
+    });
+
+  } catch (e) {
+    console.warn('Bench fetch failed:', e);
+  }
+}
+
+// ── TAB SWITCHING ─────────────────────────────────────────
+document.querySelectorAll('.nav-tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.nav-tab').forEach(b => {
+      b.classList.remove('active');
+      b.setAttribute('aria-selected', 'false');
+    });
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    btn.setAttribute('aria-selected', 'true');
+    $('panel-' + btn.dataset.tab).classList.add('active');
+    if (btn.dataset.tab === 'logs') {
+      loadLogDates();
+      loadLogs(currentLogSrc);
+    }
+    if (btn.dataset.tab === 'adaptation') fetchAdaptation();
+    if (btn.dataset.tab === 'bench') fetchBench();
+  });
+});
+
+if ($('log-date-select')) {
+  $('log-date-select').addEventListener('change', () => {
+    loadLogs(currentLogSrc);
+  });
+}
+
+document.querySelectorAll('.log-tab-btn').forEach(btn => {
+  if (!btn.dataset.logsrc && btn.id !== 'log-refresh-btn' && btn.id !== 'log-copy-btn') return;
+  btn.addEventListener('click', () => {
+    if (btn.id === 'log-refresh-btn') { loadLogs(currentLogSrc); return; }
+    if (btn.id === 'log-copy-btn') {
+      const box = $('log-box');
+      const text = box.innerText || box.textContent || '';
+      copyToClipboard(text, $('log-copy-btn'), '📋 Copy Logs');
+      return;
+    }
+    document.querySelectorAll('.log-tab-btn').forEach(b => {
+      b.classList.remove('active');
+      b.setAttribute('aria-selected', 'false');
+    });
+    btn.classList.add('active');
+    btn.setAttribute('aria-selected', 'true');
+    currentLogSrc = btn.dataset.logsrc;
+    loadLogs(currentLogSrc);
+  });
+});
+
+$('strategy-copy-btn').addEventListener('click', () => {
+  if (!lastStatus || !lastStatus.strategy) return;
+  const jsonStr = JSON.stringify(lastStatus.strategy, null, 2);
+  copyToClipboard(jsonStr, $('strategy-copy-btn'), '📋 Copy Strategy');
+});
+
+$('decision-copy-btn').addEventListener('click', () => {
+  if (!lastStatus || !lastStatus.trainer || !lastStatus.trainer.last_decision) return;
+  const jsonStr = JSON.stringify(lastStatus.trainer.last_decision, null, 2);
+  copyToClipboard(jsonStr, $('decision-copy-btn'), '📋 Copy Decision');
+});
+
+if ($('bench-refresh-btn')) {
+  $('bench-refresh-btn').addEventListener('click', fetchBench);
+}
+
+// ── API CALL HELPER ───────────────────────────────────────
+async function apiPost(endpoint, body = {}) {
+  const r = await fetch(API(endpoint), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await r.json();
+  return { ok: r.ok && data.ok !== false, status: r.status, data };
+}
+
+function showResult(id, ok, msg) {
+  const el = $(id);
+  el.className = 'cmd-result ' + (ok ? 'ok' : 'err');
+  el.textContent = msg;
+  setTimeout(() => { el.className = 'cmd-result'; }, 8000);
+}
+
+// ── TIER 1 COMMANDS ───────────────────────────────────────
+if ($('cmd-start')) {
+  $('cmd-start').addEventListener('click', async () => {
+    const r = await apiPost('/api/command/engine/start', { symbol: 'EURUSD' });
+    showResult('result-reload', r.ok, r.data.message || (r.ok ? 'Started' : 'Failed'));
+    pollStatus();
+  });
+}
+
+$('cmd-reload').addEventListener('click', async () => {
+  const r = await apiPost('/api/command/engine/reload_strategy', {});
+  showResult('result-reload', r.ok, r.data.message || (r.ok ? 'OK' : 'Failed'));
+});
+
+$('cmd-trainer-run').addEventListener('click', async () => {
+  const r = await apiPost('/api/command/trainer/run', { symbol: 'EURUSD', quick: false });
+  showResult('result-trainer', r.ok, r.ok ? `Trainer launched (PID ${r.data.pid})` : (r.data.message || 'Failed'));
+  pollStatus();
+});
+
+$('cmd-trainer-quick').addEventListener('click', async () => {
+  const r = await apiPost('/api/command/trainer/run', { symbol: 'EURUSD', quick: true });
+  showResult('result-trainer', r.ok, r.ok ? `Quick trainer launched (PID ${r.data.pid})` : (r.data.message || 'Failed'));
+  pollStatus();
+});
+
+// ── MODAL MANAGEMENT & KEYBOARD ACCESSIBILITY ────────────
+function closeActiveModals() {
+  $('modal-t2').classList.remove('open');
+  $('modal-t3').classList.remove('open');
+  pendingT2Action = null;
+}
+
+// Keyboard Escape listener to dismiss modals
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    closeActiveModals();
+  }
+});
+
+// Backdrop click listener to close modals
+['modal-t2', 'modal-t3'].forEach(id => {
+  $(id).addEventListener('click', (e) => {
+    if (e.target.classList.contains('modal-backdrop')) {
+      closeActiveModals();
+    }
+  });
+});
+
+// ── TIER 2 MODAL ──────────────────────────────────────────
+function openT2(title, desc, info, endpoint, onDone) {
+  $('modal-t2-title').textContent = title;
+  $('modal-t2-desc').textContent  = desc;
+  const infoEl = $('modal-t2-info');
+  if (info) { infoEl.textContent = info; infoEl.style.display = 'block'; }
+  else { infoEl.style.display = 'none'; }
+  $('modal-t2-reason').value = '';
+  $('modal-t2-confirm').disabled = true;
+  pendingT2Action = { endpoint, onDone };
+  $('modal-t2').classList.add('open');
+  setTimeout(() => $('modal-t2-reason').focus(), 80);
+}
+
+$('modal-t2-reason').addEventListener('input', e => {
+  $('modal-t2-confirm').disabled = !e.target.value.trim();
+});
+
+$('modal-t2-cancel').addEventListener('click', closeActiveModals);
+
+$('modal-t2-confirm').addEventListener('click', async () => {
+  if (!pendingT2Action) return;
+  const reason = $('modal-t2-reason').value.trim();
+  closeActiveModals();
+  const { endpoint, onDone } = pendingT2Action;
+  pendingT2Action = null;
+  const r = await apiPost(endpoint, { reason });
+  showResult('result-tier2', r.ok, r.data.message || (r.ok ? 'Done' : 'Failed'));
+  if (onDone) onDone(r);
+  setTimeout(pollStatus, 1500);
+});
+
+$('cmd-stop').addEventListener('click', () => {
+  const eng = lastStatus?.engine;
+  const info = eng?.running ? `Engine PID: ${eng.pid}  ·  Symbol: ${eng.symbol}` : 'Engine is currently stopped';
+  openT2('Graceful Stop',
+         'Sends SIGTERM to the Engine. Engine will finish its current candle and exit cleanly. Open positions are managed by broker SL/TP.',
+         info, '/api/command/engine/stop');
+});
+
+$('cmd-restart').addEventListener('click', () => {
+  const eng = lastStatus?.engine;
+  const info = eng?.running ? `Current PID: ${eng.pid}  ·  Symbol: ${eng.symbol}` : 'Engine not running — will start fresh';
+  openT2('Graceful Restart',
+         'Sends SIGTERM, waits for clean exit, then relaunches the Engine. SAFE_MODE clears on restart (resets to False in __init__).',
+         info, '/api/command/engine/restart');
+});
+
+$('cmd-clear-safe-mode').addEventListener('click', () => {
+  const eng = lastStatus?.engine;
+  const cusum = lastStatus?.cusum;
+  let info = '';
+  if (eng?.safe_mode || eng?.circuit_breaker) {
+    const reasons = [];
+    if (cusum?.tripped) reasons.push(`CUSUM: ${cusum.reason || 'tripped'}`);
+    if (eng?.circuit_breaker) reasons.push('Circuit breaker tripped');
+    if (eng?.safe_mode) reasons.push('SAFE_MODE active');
+    info = `Trip source(s): ${reasons.join(' | ')}\nThis will restart the Engine — SAFE_MODE clears on reinit.`;
+  } else {
+    info = 'Engine is not currently in SAFE_MODE. Restart will still proceed.';
+  }
+  openT2('Clear SAFE_MODE (via Restart)',
+         'Gracefully stops the Engine and relaunches it. SAFE_MODE and circuit_breaker reset to False on startup. No change to active_strategy.json.',
+         info, '/api/command/engine/clear_safe_mode');
+});
+
+$('cmd-trainer-stop').addEventListener('click', () => {
+  openT2('Stop Trainer',
+         'Sends SIGTERM to the running Trainer subprocess. Any in-progress run will be interrupted.',
+         null, '/api/command/trainer/stop',
+         (r) => showResult('result-trainer', r.ok, r.data.message || 'Done'));
+});
+
+// ── TIER 3 MODAL ──────────────────────────────────────────
+$('kill-phrase-display').textContent = KILL_PHRASE;
+
+$('cmd-kill').addEventListener('click', () => {
+  const eng = lastStatus?.engine;
+  const info = eng?.running
+    ? `Engine PID: ${eng.pid}  ·  Symbol: ${eng.symbol}\nStarted: ${fmt_ts_full(eng.started_at)}\n\nOpen positions are NOT closed — broker-side SL/TP handles risk.`
+    : 'Engine is not running. Hard kill will abort safely.';
+  $('modal-t3-info').textContent = info;
+  $('modal-t3-reason').value = '';
+  $('modal-t3-phrase').value = '';
+  $('modal-t3-confirm').disabled = true;
+  $('modal-t3').classList.add('open');
+  setTimeout(() => $('modal-t3-reason').focus(), 80);
+});
+
+function checkT3Phrase() {
+  $('modal-t3-confirm').disabled = $('modal-t3-phrase').value !== KILL_PHRASE;
+}
+$('modal-t3-phrase').addEventListener('input', checkT3Phrase);
+$('modal-t3-reason').addEventListener('input', checkT3Phrase);
+
+$('modal-t3-cancel').addEventListener('click', closeActiveModals);
+
+$('modal-t3-confirm').addEventListener('click', async () => {
+  if ($('modal-t3-phrase').value !== KILL_PHRASE) return;
+  closeActiveModals();
+  const r = await apiPost('/api/command/engine/kill', {
+    confirmation_phrase: KILL_PHRASE,
+    reason: $('modal-t3-reason').value.trim() || 'Hard kill via dashboard',
+  });
+  showResult('result-tier3', r.ok, r.data.message || (r.ok ? 'Engine terminated' : `Failed (HTTP ${r.status}): ${r.data.detail || r.data.message || ''}`));
+  setTimeout(pollStatus, 2000);
+});
+
+// ── INIT ──────────────────────────────────────────────────
+pollStatus();
+setInterval(pollStatus, POLL_INTERVAL_MS);
+
+// Stale check every 5s
+setInterval(() => {
+  if (lastUpdatedAt) {
+    const ageS = (Date.now() - lastUpdatedAt) / 1000;
+    if (ageS > STALE_THRESHOLD_S) {
+      $('stale-banner').classList.add('active');
+      $('stale-since').textContent = `last update ${Math.round(ageS)}s ago`;
+    }
+  }
+}, 5000);
+</script>
+</body>
+</html>

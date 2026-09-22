@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from typing import Dict, Optional
 from dataclasses import dataclass
 
+from shared.dna import compute_dna_hash
+
 log = logging.getLogger(__name__)
 
 # Default strategy file location
@@ -45,6 +47,12 @@ class StrategySpec:
     promoted_at:        str
     file_hash:          str
 
+    wf_median_win_rate:     float = 0.0
+    wf_median_profit_factor: float = 0.0
+    dna_hash:               str = ''
+    regime_target:          Optional[str] = None
+
+
     # Convenience accessors
     @property
     def fast_ma(self) -> int:
@@ -68,7 +76,13 @@ class StrategySpec:
 
     @property
     def pip_size(self) -> float:
-        return self.parameters.get('pip_size', 0.0001)
+        if 'pip_size' in self.parameters:
+            return float(self.parameters['pip_size'])
+        from shared.instrument_spec import get_spec
+        spec = get_spec(self.symbol)
+        if spec and spec.sanity_ok:
+            return spec.pip_size
+        raise ValueError(f"INSTRUMENT_SPEC_MISSING: Cannot resolve pip_size for {self.symbol}")
 
 
 class StrategyLoader:
@@ -88,16 +102,19 @@ class StrategyLoader:
 
     def _compute_file_hash(self) -> str:
         """SHA-256 of file contents."""
+        if not self.path.exists():
+            return ''
         try:
             content = self.path.read_bytes()
             return hashlib.sha256(content).hexdigest()[:16]
-        except Exception:
-            return ''
+        except Exception as e:
+            raise RuntimeError(f"STRATEGY_FILE_READ_FAILED: Cannot read strategy file {self.path}: {e}")
 
     def _load_from_file(self) -> Optional[StrategySpec]:
         """
         Load and validate strategy from JSON file.
         Returns None on any error — never raises.
+        Fails closed if baseline metrics are missing.
         """
         if not self.path.exists():
             log.warning(
@@ -127,30 +144,83 @@ class StrategyLoader:
 
         # Extract parameters
         params = data.get('parameters', {})
+        wf_summary = data.get('wf_summary', {})
         if not params:
-            # Try to get from wf_summary best_params
-            wf = data.get('wf_summary', {})
-            params = wf.get('best_params', {})
+            params = wf_summary.get('best_params', {})
+
+        # Extract OOS baseline metrics with explicit is not None checks
+        wf_win_rate = wf_summary.get('median_win_rate')
+        if wf_win_rate is None:
+            wf_win_rate = wf_summary.get('profitable_window_rate')
+        if wf_win_rate is None:
+            wf_win_rate = params.get('wf_profitable_rate')
+
+        wf_pf = wf_summary.get('median_profit_factor')
+        if wf_pf is None:
+            wf_pf = params.get('wf_median_pf')
+
+        if wf_win_rate is None or wf_pf is None:
+            log.error(
+                f"STRATEGY_LOAD_FAILED_MISSING_BASELINE: Strategy '{data['strategy_id']}' "
+                f"missing required OOS baseline metrics in JSON (win_rate={wf_win_rate}, pf={wf_pf}). "
+                "Failing closed."
+            )
+            self.load_errors += 1
+            return None
+
+        try:
+            wf_win_rate = float(wf_win_rate)
+            wf_pf = float(wf_pf)
+        except (ValueError, TypeError):
+            wf_win_rate = 0.0
+            wf_pf = 0.0
+
+        if wf_win_rate <= 0 or wf_pf <= 0:
+            log.error(
+                f"STRATEGY_LOAD_FAILED_INVALID_BASELINE: Strategy '{data['strategy_id']}' "
+                f"has invalid OOS baseline metrics in JSON (win_rate={wf_win_rate}, pf={wf_pf}). "
+                "Failing closed."
+            )
+            self.load_errors += 1
+            return None
+
+        # Verify DNA Hash (Main PRD §8.1, Engine PRD §3 Step 2)
+        stored_dna_hash = data.get('dna_hash', '')
+        filters = data.get('filters', {})
+        expected_dna_hash = compute_dna_hash(params, filters)
+
+        if not stored_dna_hash or stored_dna_hash != expected_dna_hash:
+            log.error(
+                f"STRATEGY_HASH_MISMATCH: Strategy '{data.get('strategy_id')}' DNA hash mismatch! "
+                f"Stored: '{stored_dna_hash}', Expected: '{expected_dna_hash}'. Failing closed."
+            )
+            self.load_errors += 1
+            return None
 
         file_hash = self._compute_file_hash()
 
         spec = StrategySpec(
-            strategy_id     = data['strategy_id'],
-            template        = data.get('template',
-                                       'ma_crossover'),
-            symbol          = data.get('symbol', 'EURUSD'),
-            timeframe       = data.get('timeframe', 'M15'),
-            parameters      = params,
-            filters         = data.get('filters', {}),
-            composite_score = data.get('composite_score', 0.0),
-            promoted_at     = data.get('promoted_at', ''),
-            file_hash       = file_hash,
+            strategy_id             = data['strategy_id'],
+            template                = data.get('template', 'ma_crossover'),
+            symbol                  = data.get('symbol', 'EURUSD'),
+            timeframe               = data.get('timeframe', 'M15'),
+            parameters              = params,
+            filters                 = filters,
+            composite_score         = data.get('composite_score', 0.0),
+            promoted_at             = data.get('promoted_at', ''),
+            file_hash               = file_hash,
+            wf_median_win_rate      = float(wf_win_rate),
+            wf_median_profit_factor = float(wf_pf),
+            dna_hash                = stored_dna_hash,
+            regime_target           = data.get('regime_target'),
         )
 
         log.info(
             f"Strategy loaded: {spec.strategy_id} | "
+            f"dna_hash={spec.dna_hash[:8]} | "
             f"score={spec.composite_score:.3f} | "
-            f"template={spec.template}"
+            f"wf_win_rate={spec.wf_median_win_rate:.1%} | "
+            f"wf_pf={spec.wf_median_profit_factor:.2f}"
         )
         return spec
 

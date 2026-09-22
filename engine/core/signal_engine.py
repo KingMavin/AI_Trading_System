@@ -214,6 +214,13 @@ class SignalEngine:
             res['regime'] = cache.get('regime')
             res['candle_time'] = str(cache.get('candle_time', ''))
             return res
+        elif spec.template == 'hybrid_confluence':
+            import trainer.signals.hybrid_confluence as hybrid_confluence
+            res = hybrid_confluence.generate_signal(cache, spec.parameters)
+            res['session'] = cache.get('session')
+            res['regime'] = cache.get('regime')
+            res['candle_time'] = str(cache.get('candle_time', ''))
+            return res
 
         # Validate required values
         required = ['sma_fast', 'sma_slow', 'atr', 'close']

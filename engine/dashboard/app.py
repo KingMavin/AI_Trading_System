@@ -1,22 +1,28 @@
 """
-Engine Dashboard — FastAPI backend.
+Azrael Local Dashboard — FastAPI backend (WAVE 18).
 
-Serves real-time Engine status to the browser.
-Read-only monitoring interface. Never touches MT5 directly.
-
-Run:
-  python engine/dashboard/app.py
-
-Access:
-  http://localhost:8080
+Bound strictly to 127.0.0.1:8080. Single-user, localhost-only. No auth/CSRF.
 
 Endpoints:
-  GET /              → dashboard HTML
-  GET /api/status    → full engine status JSON
-  GET /api/trades    → recent trades JSON
-  GET /api/equity    → equity curve data JSON
-  GET /api/strategy  → current strategy spec JSON
-  POST /api/command  → send command to Engine (reload only)
+  GET  /                          → dashboard HTML
+  GET  /api/status                → full system status JSON
+  GET  /api/logs/{source}         → log tail (source: engine|trades|audit|trainer)
+  GET  /api/trainer/status        → trainer subprocess state
+  GET  /api/trainer/log           → last N lines from trainer stdout
+  POST /api/command/engine/stop   → Tier 1: graceful SIGTERM
+  POST /api/command/engine/kill   → Tier 3: hard kill (requires confirmation phrase)
+  POST /api/command/engine/restart         → Tier 2: graceful stop + relaunch
+  POST /api/command/engine/clear_safe_mode → Tier 2: restart to clear SAFE_MODE
+  POST /api/command/engine/reload_strategy → existing: kept as-is
+  POST /api/command/trainer/run   → Tier 1: launch trainer subprocess
+  POST /api/command/trainer/stop  → Tier 2: SIGTERM trainer subprocess
+  GET  /api/health                → liveness check
+
+Safety rules (per AGENTS.md):
+  - Never writes active_strategy.json
+  - Tier 3 hard kill: exact phrase required at API layer (not just UI)
+  - Audit event written BEFORE signal, follow-up written after (CONFIRMED/FAILED)
+  - Post-kill: polls psutil.pid_exists() to confirm death, not assumed
 """
 
 import sys
@@ -25,70 +31,130 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import json
 import logging
+import os
+import signal
+import subprocess
+import threading
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 log = logging.getLogger(__name__)
 
-# ── CHECK DEPENDENCIES ─────────────────────────────────
+# ── DEPENDENCY CHECKS ──────────────────────────────────
 try:
     from fastapi import FastAPI, HTTPException
+    from fastapi.middleware.trustedhost import TrustedHostMiddleware
     from fastapi.responses import HTMLResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
+    from pydantic import BaseModel
     import uvicorn
     FASTAPI_AVAILABLE = True
 except ImportError:
     FASTAPI_AVAILABLE = False
-    print("FastAPI not installed.")
-    print("Run: pip install fastapi uvicorn")
+    print("FastAPI not installed. Run: pip install fastapi uvicorn")
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
+# ── PATHS ───────────────────────────────────────────────
+ENGINE_ROOT      = Path(__file__).parent.parent
+ATS_ROOT         = ENGINE_ROOT.parent
+TRAINER_ROOT     = ATS_ROOT / 'trainer'
+
+STRATEGY_PATH    = ENGINE_ROOT / 'strategy'  / 'active_strategy.json'
+DEGRADATION_PATH = ENGINE_ROOT / 'state'     / 'degradation_status.json'
+STATE_PATH       = ENGINE_ROOT / 'state'     / 'engine_state.json'
+CUSUM_PATH       = ENGINE_ROOT / 'state'     / 'cusum_state.json'
+ENGINE_LOCK_PATH = ENGINE_ROOT / 'state'     / 'engine.lock.json'
+SHUTDOWN_FLAG    = ENGINE_ROOT / 'state'     / 'shutdown_flag.json'
+LOGS_PATH        = ENGINE_ROOT / 'logs'
+AUDIT_LEDGER     = ENGINE_ROOT / 'logs'      / 'audit_ledger.jsonl'
+DECISION_LOG     = TRAINER_ROOT / 'trainer_data' / 'history' / 'decision_log.jsonl'
+KB_PATH          = TRAINER_ROOT / 'trainer_data' / 'history' / 'knowledge_base.json'
+
+TRAINER_SCRIPT   = TRAINER_ROOT / 'trainer.py'
+
+# Hard-kill confirmation phrase (validated at API layer)
+KILL_PHRASE = "KILL AZRAEL ENGINE"
+
+# ── PROCESS HELPERS IMPORT ──────────────────────────────
+from engine.dashboard.process_helpers import (
+    find_engine_pid,
+    engine_is_running,
+    get_engine_lock_info,
+    graceful_stop_engine,
+    hard_kill_engine,
+    write_audit_event,
+    trainer as _trainer,
+)
 
 
-# ── DATA PATHS ─────────────────────────────────────────
-ENGINE_ROOT       = Path(__file__).parent.parent
-STRATEGY_PATH     = ENGINE_ROOT / 'strategy' / 'active_strategy.json'
-DEGRADATION_PATH  = ENGINE_ROOT / 'state' / 'degradation_status.json'
-LOGS_PATH         = ENGINE_ROOT / 'logs'
-STATE_PATH        = ENGINE_ROOT / 'state' / 'engine_state.json'
+# ── DATA READERS ────────────────────────────────────────
 
-
-# ── DATA READERS ───────────────────────────────────────
-
-def read_json_safe(path: Path,
-                   default: Dict = None) -> Dict:
+def read_json_safe(path: Path, default: Optional[Dict] = None) -> Dict:
     """Read JSON file safely. Returns default on any error."""
     default = default or {}
     if not path.exists():
         return default
     try:
-        with open(path) as f:
+        with open(path, encoding='utf-8') as f:
             return json.load(f)
     except Exception as e:
         log.warning(f"Could not read {path}: {e}")
         return default
 
 
-def read_recent_trades(n: int = 50) -> List[Dict]:
-    """
-    Read most recent N trades from log files.
-    Reads today's log file first, then yesterday's if needed.
-    """
-    trades = []
-    log_files = sorted(
-        LOGS_PATH.glob('*.jsonl'),
-        reverse=True
-    )
+def tail_text_file(path: Path, n: int = 100) -> List[str]:
+    """Return the last N lines of a text file."""
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+        return lines[-n:]
+    except Exception as e:
+        log.warning(f"Could not tail {path}: {e}")
+        return []
 
-    for log_file in log_files[:3]:  # check last 3 days
+
+def tail_jsonl_file(path: Path, n: int = 50) -> List[Dict]:
+    """Return the last N valid JSON objects from a .jsonl file."""
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+        result = []
+        for line in reversed(lines):
+            if not line.strip():
+                continue
+            try:
+                result.append(json.loads(line))
+                if len(result) >= n:
+                    break
+            except json.JSONDecodeError:
+                continue
+        return list(reversed(result))
+    except Exception as e:
+        log.warning(f"Could not read jsonl {path}: {e}")
+        return []
+
+
+def read_recent_trades(n: int = 50) -> List[Dict]:
+    """Read most recent N trade records from *.jsonl log files."""
+    trades: List[Dict] = []
+    log_files = sorted(LOGS_PATH.glob('*.jsonl'), reverse=True)
+    for log_file in log_files[:3]:
         if len(trades) >= n:
             break
         try:
-            lines = log_file.read_text().strip().split('\n')
+            lines = log_file.read_text(encoding='utf-8', errors='replace').splitlines()
             for line in reversed(lines):
                 if not line.strip():
                     continue
                 try:
                     record = json.loads(line)
-                    # Only include trade records, not events
                     if 'trade_id' in record:
                         trades.append(record)
                     if len(trades) >= n:
@@ -97,105 +163,95 @@ def read_recent_trades(n: int = 50) -> List[Dict]:
                     continue
         except Exception:
             continue
-
     return trades
 
 
-def build_equity_curve(trades: List[Dict],
-                        initial_equity: float = 10000.0
-                        ) -> List[Dict]:
-    """
-    Build equity curve from trade list.
-    Returns list of {time, equity} points.
-    """
+def build_equity_curve(trades: List[Dict], initial_equity: float = 10000.0) -> List[Dict]:
+    """Build equity curve from trade list."""
     if not trades:
-        return [{'time': datetime.now(
-            timezone.utc
-        ).isoformat(), 'equity': initial_equity}]
-
-    # Sort trades by exit time
+        return [{'time': datetime.now(timezone.utc).isoformat(), 'equity': initial_equity}]
     sorted_trades = sorted(
         [t for t in trades if 'exit_time' in t],
         key=lambda x: x.get('exit_time', '')
     )
-
-    equity  = initial_equity
-    curve   = [{'time': sorted_trades[0].get(
-        'entry_time', ''
-    ), 'equity': equity}]
-
+    equity = initial_equity
+    curve = [{'time': sorted_trades[0].get('entry_time', ''), 'equity': equity}] if sorted_trades else []
     for trade in sorted_trades:
         equity += trade.get('net_pnl', 0)
-        curve.append({
-            'time':   trade.get('exit_time', ''),
-            'equity': round(equity, 2),
-        })
-
+        curve.append({'time': trade.get('exit_time', ''), 'equity': round(equity, 2)})
     return curve
 
 
+def get_last_decision() -> Optional[Dict]:
+    """Return the last entry from the Trainer decision log."""
+    entries = tail_jsonl_file(DECISION_LOG, n=1)
+    return entries[0] if entries else None
+
+
 def get_engine_status() -> Dict:
-    """
-    Compile full engine status from all data sources.
-    Returns a comprehensive status dict for the dashboard.
-    """
+    """Compile full system status from all state files."""
     strategy    = read_json_safe(STRATEGY_PATH)
     degradation = read_json_safe(DEGRADATION_PATH)
     state       = read_json_safe(STATE_PATH)
+    cusum       = read_json_safe(CUSUM_PATH)
+    lock_info   = get_engine_lock_info()
+    trainer_st  = _trainer.get_status()
+    last_dec    = get_last_decision()
+
+    # Performance from recent trades
     trades      = read_recent_trades(100)
-
-    # Compute summary stats from recent trades
     recent_50   = trades[:50]
-    winners     = [t for t in recent_50
-                   if t.get('net_pnl', 0) > 0]
+    winners     = [t for t in recent_50 if t.get('net_pnl', 0) > 0]
     total_pnl   = sum(t.get('net_pnl', 0) for t in recent_50)
-    win_rate    = (len(winners) / len(recent_50)
-                   if recent_50 else 0)
+    win_rate    = len(winners) / len(recent_50) if recent_50 else 0.0
+    gross_profit = sum(t.get('net_pnl', 0) for t in recent_50 if t.get('net_pnl', 0) > 0)
+    gross_loss   = abs(sum(t.get('net_pnl', 0) for t in recent_50 if t.get('net_pnl', 0) < 0))
+    profit_factor = gross_profit / gross_loss if gross_loss > 0 else 0.0
 
-    gross_profit = sum(
-        t.get('net_pnl', 0) for t in recent_50
-        if t.get('net_pnl', 0) > 0
-    )
-    gross_loss   = abs(sum(
-        t.get('net_pnl', 0) for t in recent_50
-        if t.get('net_pnl', 0) < 0
-    ))
-    profit_factor = (
-        gross_profit / gross_loss
-        if gross_loss > 0 else 0
-    )
+    # Engine running state — lockfile is authoritative
+    eng_running = lock_info is not None
 
     return {
-        'timestamp':         datetime.now(
-            timezone.utc
-        ).isoformat(),
-        'engine_running':    state.get('running', False),
+        'timestamp':     datetime.now(timezone.utc).isoformat(),
+        'engine': {
+            'running':           eng_running,
+            'pid':               lock_info.get('pid') if lock_info else None,
+            'started_at':        lock_info.get('started_at') if lock_info else None,
+            'symbol':            lock_info.get('symbol') if lock_info else None,
+            'safe_mode':         state.get('safe_mode', False),
+            'circuit_breaker':   state.get('circuit_breaker_tripped', False),
+            'algo_trading_on':   state.get('algo_trading_enabled', None),
+            'open_position':     state.get('open_position'),
+            'session':           state.get('session', 'UNKNOWN'),
+            'regime':            state.get('regime', 'UNKNOWN'),
+            'equity':            state.get('equity', 0),
+            'updated_at':        state.get('updated_at'),
+            'checklist':         state.get('checklist'),
+        },
+        'cusum': {
+            'tripped':   cusum.get('cusum_tripped', False),
+            'reason':    cusum.get('cusum_reason', ''),
+            's_i':       cusum.get('s_i', 0),
+            'h':         cusum.get('h', 0),
+            'p0':        cusum.get('p0', 0),
+            'win_rate':  cusum.get('win_rate', 0),
+            'n_trades':  cusum.get('n_trades', 0),
+        },
         'strategy': {
-            'id':            strategy.get(
-                'strategy_id', 'No strategy loaded'
-            ),
-            'template':      strategy.get(
-                'template', 'unknown'
-            ),
-            'score':         strategy.get(
-                'composite_score', 0
-            ),
-            'promoted_at':   strategy.get('promoted_at', ''),
-            'parameters':    strategy.get('parameters', {}),
+            'id':          strategy.get('strategy_id', 'No strategy loaded'),
+            'dna_hash':    strategy.get('dna_hash', ''),
+            'template':    strategy.get('template', 'unknown'),
+            'score':       strategy.get('composite_score', 0),
+            'promoted_at': strategy.get('promoted_at', ''),
+            'parameters':  strategy.get('parameters', {}),
         },
         'degradation': {
-            'status':        degradation.get('status', 'OK'),
-            'alert_count':   degradation.get('alert_count', 0),
-            'rolling_pf':    degradation.get('rolling_pf', 0),
-            'rolling_wr':    degradation.get(
-                'rolling_win_rate', 0
-            ),
-            'loss_streak':   degradation.get(
-                'current_loss_streak', 0
-            ),
-            'rerun_recommended': degradation.get(
-                'rerun_recommended', False
-            ),
+            'status':            degradation.get('status', 'OK'),
+            'alert_count':       degradation.get('alert_count', 0),
+            'rolling_pf':        degradation.get('rolling_pf', 0),
+            'rolling_wr':        degradation.get('rolling_win_rate', 0),
+            'loss_streak':       degradation.get('current_loss_streak', 0),
+            'rerun_recommended': degradation.get('rerun_recommended', False),
         },
         'performance': {
             'total_trades':  len(trades),
@@ -204,830 +260,519 @@ def get_engine_status() -> Dict:
             'total_pnl':     round(total_pnl, 2),
             'profit_factor': round(profit_factor, 3),
         },
-        'current_state': {
-            'session':       state.get('session', 'UNKNOWN'),
-            'regime':        state.get('regime', 'UNKNOWN'),
-            'equity':        state.get('equity', 0),
-            'open_position': state.get('open_position'),
+        'trainer': {
+            'running':      trainer_st.get('running', False),
+            'pid':          trainer_st.get('pid'),
+            'last_result':  trainer_st.get('last_result'),
+            'last_decision': last_dec,
         },
     }
 
 
-# ── FASTAPI APP ────────────────────────────────────────
+# ── PYDANTIC REQUEST MODELS ─────────────────────────────
+
+if FASTAPI_AVAILABLE:
+    class CommandRequest(BaseModel):
+        reason: str = ''
+        symbol: str = 'EURUSD'
+        quick:  bool = False
+        confirmation_phrase: str = ''
+        strategy_id: str = ''
+
+
+# ── FASTAPI APP ─────────────────────────────────────────
 
 if FASTAPI_AVAILABLE:
     app = FastAPI(
-        title="ATS Engine Dashboard",
-        description="Read-only monitoring for ATS Engine",
-        version="1.0"
+        title="Azrael Local Dashboard",
+        description="ATS Engine & Trainer control panel — localhost only",
+        version="2.0"
     )
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=["127.0.0.1", "localhost", "testserver"]
+    )
+
+    # ── STATUS & DATA ──────────────────────────────────
 
     @app.get("/", response_class=HTMLResponse)
     async def root():
-        """Serve the dashboard HTML."""
-        html_path = (
-            Path(__file__).parent / 'static' / 'dashboard.html'
-        )
+        html_path = Path(__file__).parent / 'static' / 'dashboard.html'
         if html_path.exists():
-            return HTMLResponse(html_path.read_text())
-        return HTMLResponse(DASHBOARD_HTML)
+            return HTMLResponse(html_path.read_text(encoding='utf-8'))
+        return HTMLResponse("<h1>Dashboard HTML not found. Deploy static/dashboard.html</h1>")
 
     @app.get("/api/status")
     async def api_status():
-        """Full engine status."""
         return JSONResponse(get_engine_status())
 
     @app.get("/api/trades")
     async def api_trades(n: int = 50):
-        """Recent trades."""
         trades = read_recent_trades(n)
         return JSONResponse({'trades': trades})
 
     @app.get("/api/equity")
     async def api_equity():
-        """Equity curve data."""
         trades = read_recent_trades(200)
         curve  = build_equity_curve(trades)
         return JSONResponse({'equity_curve': curve})
 
     @app.get("/api/strategy")
     async def api_strategy():
-        """Current strategy specification."""
-        strategy = read_json_safe(STRATEGY_PATH)
-        return JSONResponse(strategy)
+        return JSONResponse(read_json_safe(STRATEGY_PATH))
 
-    @app.post("/api/command/{command}")
-    async def api_command(command: str):
+    @app.get("/api/logs/dates")
+    async def api_log_dates():
         """
-        Send a command to the Engine.
-        Only 'reload_strategy' is supported.
+        List available log dates from engine/logs directory.
+        Returns a sorted list of unique log dates (newest first).
         """
-        if command == 'reload_strategy':
-            # Engine checks for file changes on next candle
-            # This endpoint just confirms the request
-            return JSONResponse({
-                'status':  'ok',
-                'command': command,
-                'message': (
-                    'Engine will reload strategy on '
-                    'next candle close.'
-                ),
-            })
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown command: {command}. "
-                   f"Supported: reload_strategy"
-        )
+        dates_set = set()
+        today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        dates_set.add(today_str)
+
+        if LOGS_PATH.exists():
+            for p in LOGS_PATH.glob('engine_*.log'):
+                name = p.stem  # engine_YYYYMMDD
+                parts = name.split('_')
+                if len(parts) >= 2 and len(parts[1]) == 8 and parts[1].isdigit():
+                    ds = f"{parts[1][:4]}-{parts[1][4:6]}-{parts[1][6:8]}"
+                    dates_set.add(ds)
+
+            for p in LOGS_PATH.glob('*.jsonl'):
+                name = p.stem
+                for token in name.split('_'):
+                    if len(token) == 8 and token.isdigit():
+                        ds = f"{token[:4]}-{token[4:6]}-{token[6:8]}"
+                        dates_set.add(ds)
+
+        sorted_dates = sorted(list(dates_set), reverse=True)
+        dates_list = [
+            {
+                'date': d,
+                'display': f"{d} (Today)" if d == today_str else d,
+                'is_today': d == today_str
+            }
+            for d in sorted_dates
+        ]
+        return JSONResponse({'dates': dates_list})
+
+    @app.get("/api/logs/{source}")
+    async def api_logs(source: str, n: int = 150, date: Optional[str] = None):
+        """
+        Tail log lines.
+        source: 'engine' | 'trades' | 'audit' | 'trainer'
+        date: optional YYYY-MM-DD string for historical log selection
+        """
+        today_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        target_date_compact = date.replace('-', '') if (date and len(date) == 10 and date.count('-') == 2) else None
+
+        if source == 'engine':
+            if target_date_compact and date != today_str:
+                target_file = LOGS_PATH / f"engine_{target_date_compact}.log"
+                if target_file.exists():
+                    lines = tail_text_file(target_file, n=n)
+                    return JSONResponse({'lines': lines, 'source': source, 'file': target_file.name, 'date': date})
+                else:
+                    return JSONResponse({'lines': [f"No engine log found for date {date}"], 'source': source, 'date': date})
+            else:
+                log_files = sorted(LOGS_PATH.glob('engine_*.log'), reverse=True)
+                if not log_files:
+                    return JSONResponse({'lines': [], 'source': source, 'date': today_str})
+                lines = tail_text_file(log_files[0], n=n)
+                return JSONResponse({'lines': lines, 'source': source, 'file': log_files[0].name, 'date': today_str})
+
+        elif source == 'trades':
+            if target_date_compact and date != today_str:
+                matching_files = list(LOGS_PATH.glob(f"*{target_date_compact}*.jsonl"))
+                if matching_files:
+                    lines = tail_text_file(matching_files[0], n=n)
+                    return JSONResponse({'lines': lines, 'source': source, 'date': date})
+                else:
+                    return JSONResponse({'lines': [f"No trade log found for date {date}"], 'source': source, 'date': date})
+            else:
+                log_files = sorted(LOGS_PATH.glob('*.jsonl'), reverse=True)
+                all_lines: List[str] = []
+                for lf in log_files[:2]:
+                    all_lines = tail_text_file(lf, n=n) + all_lines
+                return JSONResponse({'lines': all_lines[-n:], 'source': source, 'date': today_str})
+
+        elif source == 'audit':
+            lines = tail_text_file(AUDIT_LEDGER, n=n)
+            if date:
+                lines = [l for l in lines if date in l]
+            return JSONResponse({'lines': lines, 'source': source, 'date': date or today_str})
+
+        elif source == 'trainer':
+            lines = _trainer.get_log_lines()[-n:]
+            return JSONResponse({'lines': lines, 'source': source, 'date': date or today_str})
+
+        else:
+            raise HTTPException(status_code=400,
+                                detail=f"Unknown log source '{source}'. "
+                                       f"Valid: engine, trades, audit, trainer")
+
+    @app.get("/api/trainer/status")
+    async def api_trainer_status():
+        return JSONResponse(_trainer.get_status())
+
+    @app.get("/api/trainer/log")
+    async def api_trainer_log(n: int = 100):
+        return JSONResponse({'lines': _trainer.get_log_lines()[-n:]})
 
     @app.get("/api/health")
     async def api_health():
-        """Health check endpoint."""
         return JSONResponse({
             'status':    'ok',
             'timestamp': datetime.now(timezone.utc).isoformat(),
         })
 
-
-# ── EMBEDDED DASHBOARD HTML ────────────────────────────
-# Self-contained — works without static files directory.
-# Polls /api/status every 5 seconds.
-
-DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ATS Engine Dashboard</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-
-  body {
-    font-family: 'Segoe UI', system-ui, sans-serif;
-    background: #0f1117;
-    color: #e0e0e0;
-    min-height: 100vh;
-  }
-
-  header {
-    background: #1a1d2e;
-    border-bottom: 1px solid #2a2d3e;
-    padding: 16px 24px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }
-
-  header h1 {
-    font-size: 1.2rem;
-    font-weight: 600;
-    color: #fff;
-    letter-spacing: 0.05em;
-  }
-
-  #connection-status {
-    font-size: 0.8rem;
-    padding: 4px 10px;
-    border-radius: 20px;
-    background: #2a2d3e;
-  }
-
-  #connection-status.connected    { color: #4caf50; }
-  #connection-status.disconnected { color: #f44336; }
-
-  .main { padding: 24px; max-width: 1400px; margin: 0 auto; }
-
-  /* Top stat cards */
-  .stats-row {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-    gap: 16px;
-    margin-bottom: 24px;
-  }
-
-  .stat-card {
-    background: #1a1d2e;
-    border: 1px solid #2a2d3e;
-    border-radius: 10px;
-    padding: 20px;
-  }
-
-  .stat-card .label {
-    font-size: 0.75rem;
-    color: #888;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    margin-bottom: 8px;
-  }
-
-  .stat-card .value {
-    font-size: 1.8rem;
-    font-weight: 700;
-    color: #fff;
-  }
-
-  .stat-card .sub {
-    font-size: 0.8rem;
-    color: #666;
-    margin-top: 4px;
-  }
-
-  .stat-card.positive .value { color: #4caf50; }
-  .stat-card.negative .value { color: #f44336; }
-  .stat-card.warning  .value { color: #ff9800; }
-
-  /* Content grid */
-  .content-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 20px;
-    margin-bottom: 24px;
-  }
-
-  @media (max-width: 900px) {
-    .content-grid { grid-template-columns: 1fr; }
-  }
-
-  .panel {
-    background: #1a1d2e;
-    border: 1px solid #2a2d3e;
-    border-radius: 10px;
-    padding: 20px;
-  }
-
-  .panel h2 {
-    font-size: 0.85rem;
-    color: #888;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    margin-bottom: 16px;
-    border-bottom: 1px solid #2a2d3e;
-    padding-bottom: 10px;
-  }
-
-  /* Status badge */
-  .badge {
-    display: inline-block;
-    padding: 3px 10px;
-    border-radius: 12px;
-    font-size: 0.75rem;
-    font-weight: 600;
-    letter-spacing: 0.05em;
-  }
-
-  .badge.ok       { background: #1b3a1f; color: #4caf50; }
-  .badge.warning  { background: #3a2c1a; color: #ff9800; }
-  .badge.degraded { background: #3a1a1a; color: #f44336; }
-  .badge.critical { background: #f44336; color: #fff; }
-  .badge.trending { background: #1a2a3a; color: #2196f3; }
-  .badge.ranging  { background: #2a1a3a; color: #9c27b0; }
-  .badge.volatile { background: #3a2a1a; color: #ff9800; }
-  .badge.quiet    { background: #1a3a2a; color: #4caf50; }
-
-  /* Strategy info */
-  .strategy-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 8px 0;
-    border-bottom: 1px solid #2a2d3e;
-    font-size: 0.85rem;
-  }
-
-  .strategy-row:last-child { border-bottom: none; }
-  .strategy-row .key { color: #888; }
-  .strategy-row .val { color: #fff; font-weight: 500; }
-
-  /* Equity chart */
-  #equity-chart {
-    width: 100%;
-    height: 200px;
-    position: relative;
-  }
-
-  canvas {
-    width: 100% !important;
-    height: 100% !important;
-  }
-
-  /* Trades table */
-  .trades-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.8rem;
-  }
-
-  .trades-table th {
-    color: #888;
-    text-align: left;
-    padding: 6px 8px;
-    border-bottom: 1px solid #2a2d3e;
-    font-weight: 500;
-    font-size: 0.72rem;
-    text-transform: uppercase;
-  }
-
-  .trades-table td {
-    padding: 7px 8px;
-    border-bottom: 1px solid #1e2130;
-    color: #ccc;
-  }
-
-  .trades-table tr:hover td { background: #1e2130; }
-
-  .pnl-positive { color: #4caf50; font-weight: 600; }
-  .pnl-negative { color: #f44336; font-weight: 600; }
-
-  /* Degradation meter */
-  .deg-meter {
-    margin: 12px 0;
-  }
-
-  .deg-label {
-    display: flex;
-    justify-content: space-between;
-    font-size: 0.8rem;
-    color: #888;
-    margin-bottom: 6px;
-  }
-
-  .deg-bar {
-    height: 8px;
-    background: #2a2d3e;
-    border-radius: 4px;
-    overflow: hidden;
-  }
-
-  .deg-fill {
-    height: 100%;
-    border-radius: 4px;
-    transition: width 0.5s ease;
-  }
-
-  .deg-fill.ok       { background: #4caf50; }
-  .deg-fill.warning  { background: #ff9800; }
-  .deg-fill.degraded { background: #f44336; }
-
-  /* Last updated */
-  #last-updated {
-    text-align: center;
-    color: #444;
-    font-size: 0.75rem;
-    margin-top: 16px;
-  }
-
-  /* No data placeholder */
-  .no-data {
-    text-align: center;
-    color: #444;
-    padding: 20px;
-    font-size: 0.85rem;
-  }
-</style>
-</head>
-<body>
-
-<header>
-  <h1>⚡ ATS ENGINE DASHBOARD</h1>
-  <span id="connection-status" class="disconnected">
-    ● CONNECTING...
-  </span>
-</header>
-
-<div class="main">
-
-  <!-- Stat Cards Row -->
-  <div class="stats-row">
-    <div class="stat-card" id="card-equity">
-      <div class="label">Account Equity</div>
-      <div class="value" id="stat-equity">—</div>
-      <div class="sub" id="stat-equity-sub">—</div>
-    </div>
-    <div class="stat-card" id="card-pnl">
-      <div class="label">Total P&L (recent 50)</div>
-      <div class="value" id="stat-pnl">—</div>
-      <div class="sub" id="stat-pnl-sub">—</div>
-    </div>
-    <div class="stat-card" id="card-pf">
-      <div class="label">Profit Factor</div>
-      <div class="value" id="stat-pf">—</div>
-      <div class="sub">Recent 50 trades</div>
-    </div>
-    <div class="stat-card" id="card-wr">
-      <div class="label">Win Rate</div>
-      <div class="value" id="stat-wr">—</div>
-      <div class="sub" id="stat-wr-sub">—</div>
-    </div>
-    <div class="stat-card" id="card-session">
-      <div class="label">Session / Regime</div>
-      <div class="value" id="stat-session">—</div>
-      <div class="sub" id="stat-regime">—</div>
-    </div>
-    <div class="stat-card" id="card-degrade">
-      <div class="label">Strategy Health</div>
-      <div class="value" id="stat-degrade">—</div>
-      <div class="sub" id="stat-degrade-sub">—</div>
-    </div>
-  </div>
-
-  <!-- Content Grid -->
-  <div class="content-grid">
-
-    <!-- Left: Strategy + Equity -->
-    <div>
-      <div class="panel" style="margin-bottom:20px">
-        <h2>Current Strategy</h2>
-        <div id="strategy-info">
-          <div class="no-data">Loading...</div>
-        </div>
-      </div>
-
-      <div class="panel">
-        <h2>Equity Curve</h2>
-        <div id="equity-chart">
-          <canvas id="equity-canvas"></canvas>
-        </div>
-      </div>
-    </div>
-
-    <!-- Right: Degradation + Trades -->
-    <div>
-      <div class="panel" style="margin-bottom:20px">
-        <h2>Degradation Monitor</h2>
-        <div id="degradation-info">
-          <div class="no-data">Loading...</div>
-        </div>
-      </div>
-
-      <div class="panel">
-        <h2>Recent Trades</h2>
-        <div id="trades-container">
-          <div class="no-data">Loading...</div>
-        </div>
-      </div>
-    </div>
-
-  </div>
-
-  <div id="last-updated">Last updated: —</div>
-</div>
-
-<script>
-// ── DATA STATE ───────────────────────────────────────
-let equityCurve = [];
-let lastStatus  = null;
-
-// ── FETCH STATUS ─────────────────────────────────────
-async function fetchStatus() {
-  try {
-    const res  = await fetch('/api/status');
-    const data = await res.json();
-    lastStatus = data;
-    updateDashboard(data);
-    setConnected(true);
-  } catch (e) {
-    setConnected(false);
-  }
-}
-
-async function fetchEquity() {
-  try {
-    const res  = await fetch('/api/equity');
-    const data = await res.json();
-    equityCurve = data.equity_curve || [];
-    drawEquityCurve();
-  } catch (e) {}
-}
-
-async function fetchTrades() {
-  try {
-    const res  = await fetch('/api/trades?n=20');
-    const data = await res.json();
-    renderTrades(data.trades || []);
-  } catch (e) {}
-}
-
-// ── CONNECTION STATUS ─────────────────────────────────
-function setConnected(connected) {
-  const el = document.getElementById('connection-status');
-  if (connected) {
-    el.textContent  = '● LIVE';
-    el.className    = 'connected';
-  } else {
-    el.textContent  = '● OFFLINE';
-    el.className    = 'disconnected';
-  }
-}
-
-// ── UPDATE DASHBOARD ──────────────────────────────────
-function updateDashboard(data) {
-  const s = data.strategy    || {};
-  const d = data.degradation || {};
-  const p = data.performance || {};
-  const c = data.current_state || {};
-
-  // Equity card
-  const equity = c.equity || 0;
-  setText('stat-equity', equity
-    ? '$' + equity.toLocaleString('en', {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2
-      })
-    : '—'
-  );
-  const pos = c.open_position;
-  setText('stat-equity-sub', pos
-    ? `Open: ${pos.direction} ${pos.lots}L`
-    : 'No open position'
-  );
-
-  // P&L card
-  const pnl = p.total_pnl || 0;
-  setText('stat-pnl', (pnl >= 0 ? '+' : '') +
-    '$' + pnl.toFixed(2));
-  setCard('card-pnl',
-    pnl > 0 ? 'positive' : pnl < 0 ? 'negative' : '');
-  setText('stat-pnl-sub',
-    `${p.recent_trades || 0} recent trades`);
-
-  // PF card
-  const pf = p.profit_factor || 0;
-  setText('stat-pf', pf > 0 ? pf.toFixed(3) : '—');
-  setCard('card-pf',
-    pf > 1.2 ? 'positive' : pf > 0 && pf < 1.0 ? 'negative' : '');
-
-  // Win rate card
-  const wr = (p.win_rate || 0) * 100;
-  setText('stat-wr', wr > 0 ? wr.toFixed(1) + '%' : '—');
-  setText('stat-wr-sub',
-    `${p.total_trades || 0} total trades`);
-
-  // Session/Regime card
-  setText('stat-session', c.session || '—');
-  setText('stat-regime', c.regime || '—');
-
-  // Degradation card
-  const status = d.status || 'OK';
-  setText('stat-degrade', status);
-  setText('stat-degrade-sub',
-    `Alerts: ${d.alert_count || 0} | ` +
-    `Streak: ${d.loss_streak || 0}`);
-  setCard('card-degrade',
-    status === 'OK' ? 'positive' :
-    status === 'WARNING' ? 'warning' : 'negative');
-
-  // Strategy panel
-  renderStrategy(s, d);
-
-  // Degradation panel
-  renderDegradation(d);
-
-  // Last updated
-  setText('last-updated',
-    'Last updated: ' + new Date().toLocaleTimeString());
-}
-
-// ── RENDER STRATEGY PANEL ─────────────────────────────
-function renderStrategy(s, d) {
-  const promoted = s.promoted_at
-    ? new Date(s.promoted_at).toLocaleDateString()
-    : 'Unknown';
-
-  const params = s.parameters || {};
-  const html = `
-    <div class="strategy-row">
-      <span class="key">Strategy ID</span>
-      <span class="val">${s.id || '—'}</span>
-    </div>
-    <div class="strategy-row">
-      <span class="key">Template</span>
-      <span class="val">${s.template || '—'}</span>
-    </div>
-    <div class="strategy-row">
-      <span class="key">Score</span>
-      <span class="val">${
-        s.score ? s.score.toFixed(3) : '—'
-      }</span>
-    </div>
-    <div class="strategy-row">
-      <span class="key">Promoted</span>
-      <span class="val">${promoted}</span>
-    </div>
-    <div class="strategy-row">
-      <span class="key">Fast MA</span>
-      <span class="val">${params.fast_ma_period || '—'}</span>
-    </div>
-    <div class="strategy-row">
-      <span class="key">Slow MA</span>
-      <span class="val">${params.slow_ma_period || '—'}</span>
-    </div>
-    <div class="strategy-row">
-      <span class="key">SL ATR</span>
-      <span class="val">${params.sl_atr_multiple || '—'}×</span>
-    </div>
-    <div class="strategy-row">
-      <span class="key">TP R:R</span>
-      <span class="val">${params.tp_rr_ratio || '—'}R</span>
-    </div>
-    <div class="strategy-row">
-      <span class="key">Risk/Trade</span>
-      <span class="val">${
-        params.risk_per_trade_pct || '—'
-      }%</span>
-    </div>
-    ${d.rerun_recommended ? `
-    <div style="margin-top:12px;padding:10px;
-                background:#3a1a1a;border-radius:6px;
-                font-size:0.8rem;color:#ff9800;">
-      ⚠ Trainer re-run recommended
-    </div>` : ''}
-  `;
-  document.getElementById('strategy-info').innerHTML = html;
-}
-
-// ── RENDER DEGRADATION PANEL ─────────────────────────
-function renderDegradation(d) {
-  const status    = d.status || 'OK';
-  const alertPct  = Math.min(
-    (d.alert_count || 0) / 3 * 100, 100
-  );
-  const rollPF    = d.rolling_pf || 0;
-  const rollWR    = ((d.rolling_wr || 0) * 100).toFixed(1);
-  const streak    = d.loss_streak || 0;
-
-  const statusClass = status.toLowerCase();
-
-  const html = `
-    <div class="strategy-row">
-      <span class="key">Status</span>
-      <span class="badge ${statusClass}">${status}</span>
-    </div>
-    <div class="strategy-row">
-      <span class="key">Rolling PF</span>
-      <span class="val" style="color:${
-        rollPF >= 1.0 ? '#4caf50' : '#f44336'
-      }">${rollPF > 0 ? rollPF.toFixed(3) : '—'}</span>
-    </div>
-    <div class="strategy-row">
-      <span class="key">Rolling Win Rate</span>
-      <span class="val">${rollPF > 0 ? rollWR + '%' : '—'}</span>
-    </div>
-    <div class="strategy-row">
-      <span class="key">Loss Streak</span>
-      <span class="val" style="color:${
-        streak >= 5 ? '#ff9800' : '#ccc'
-      }">${streak}</span>
-    </div>
-
-    <div class="deg-meter">
-      <div class="deg-label">
-        <span>Alert Level</span>
-        <span>${d.alert_count || 0}/3</span>
-      </div>
-      <div class="deg-bar">
-        <div class="deg-fill ${statusClass}"
-             style="width:${alertPct}%"></div>
-      </div>
-    </div>
-
-    ${d.rerun_recommended ? `
-      <div style="font-size:0.8rem;color:#ff9800;
-                  margin-top:8px;">
-        ${d.rerun_reason || 'Re-run recommended'}
-      </div>
-    ` : `
-      <div style="font-size:0.8rem;color:#4caf50;
-                  margin-top:8px;">
-        Strategy performing within expected parameters.
-      </div>
-    `}
-  `;
-  document.getElementById('degradation-info').innerHTML = html;
-}
-
-// ── RENDER TRADES TABLE ───────────────────────────────
-function renderTrades(trades) {
-  if (!trades || trades.length === 0) {
-    document.getElementById('trades-container').innerHTML =
-      '<div class="no-data">No trades recorded yet.</div>';
-    return;
-  }
-
-  const rows = trades.slice(0, 15).map(t => {
-    const pnl    = t.net_pnl || 0;
-    const cls    = pnl >= 0 ? 'pnl-positive' : 'pnl-negative';
-    const time   = t.exit_time
-      ? new Date(t.exit_time).toLocaleString('en', {
-          month:'2-digit', day:'2-digit',
-          hour:'2-digit', minute:'2-digit'
+    # ── ADAPTATION & BENCH ENDPOINTS (WAVE 19) ─────────
+
+    @app.get("/api/adaptation/latest")
+    async def api_adaptation_latest():
+        """
+        Returns the latest Trainer decision from decision_log.jsonl,
+        along with parameter diffs against current active strategy and 10-gate breakdown.
+        """
+        active_strat = read_json_safe(STRATEGY_PATH)
+        records = tail_jsonl_file(DECISION_LOG, n=1)
+        if not records:
+            return JSONResponse({
+                'has_decision': False,
+                'message': 'No trainer decision records found in decision_log.jsonl',
+                'active_strategy': active_strat,
+            })
+
+        latest = records[-1]
+        active_params = active_strat.get('parameters', {})
+        candidate_params = latest.get('parameters', {})
+        if not candidate_params and 'gate_results' in latest:
+            # Fallback parameter extraction if nested
+            candidate_params = latest.get('candidate_parameters', {})
+
+        param_diff = []
+        all_keys = sorted(set(list(active_params.keys()) + list(candidate_params.keys())))
+        for k in all_keys:
+            act_val = active_params.get(k, '—')
+            cand_val = candidate_params.get(k, '—')
+            changed = str(act_val) != str(cand_val)
+            param_diff.append({
+                'parameter': k,
+                'active_value': act_val,
+                'candidate_value': cand_val,
+                'changed': changed
+            })
+
+        # 10-Gate Threshold Mapping
+        gate_thresholds = {
+            'gate_1_total_trades': {'label': 'Gate 1: Total Trades', 'threshold': '>= 100'},
+            'gate_2_trades_per_window': {'label': 'Gate 2: Trades / Window', 'threshold': '>= 10.0'},
+            'gate_3_valid_windows': {'label': 'Gate 3: Valid Windows', 'threshold': '>= 5'},
+            'gate_4_max_drawdown': {'label': 'Gate 4: Max Drawdown %', 'threshold': '<= 18.0%'},
+            'gate_5_profit_factor': {'label': 'Gate 5: Profit Factor', 'threshold': '>= 1.25'},
+            'gate_6_profitable_windows': {'label': 'Gate 6: Profitable Window Rate', 'threshold': '>= 60.0%'},
+            'gate_7_consecutive_losses': {'label': 'Gate 7: Max Consecutive Losses', 'threshold': '<= 10'},
+            'gate_8_regime_coverage': {'label': 'Gate 8: Regime Coverage', 'threshold': '>= 3'},
+            'gate_9_mandate_compliant': {'label': 'Gate 9: Mandate Compliance', 'threshold': 'TRUE'},
+            'gate_10_monte_carlo_stress': {'label': 'Gate 10: Monte Carlo Stress', 'threshold': '>= 0.0'}
+        }
+
+        gate_breakdown = []
+        results = latest.get('gate_results', {})
+        for g_key, g_meta in gate_thresholds.items():
+            val = results.get(g_key, '—')
+            # Determine pass/fail based on outcome flags or metric evaluation
+            failed_flags = latest.get('flags', [])
+            passed = not any(g_key in f for f in failed_flags) if isinstance(failed_flags, list) else True
+            gate_breakdown.append({
+                'gate': g_meta['label'],
+                'metric_value': val,
+                'threshold': g_meta['threshold'],
+                'passed': passed
+            })
+
+        return JSONResponse({
+            'has_decision': True,
+            'decision': latest,
+            'active_strategy': active_strat,
+            'parameter_diff': param_diff,
+            'gate_breakdown': gate_breakdown
         })
-      : '—';
-    return `
-      <tr>
-        <td>${time}</td>
-        <td>${t.direction || '—'}</td>
-        <td>${(t.exit_price||0).toFixed(5)}</td>
-        <td class="${cls}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</td>
-        <td>${t.close_reason || '—'}</td>
-        <td>${t.entry_session || '—'}</td>
-      </tr>
-    `;
-  }).join('');
 
-  document.getElementById('trades-container').innerHTML = `
-    <table class="trades-table">
-      <thead>
-        <tr>
-          <th>Time</th>
-          <th>Dir</th>
-          <th>Exit</th>
-          <th>P&L</th>
-          <th>Reason</th>
-          <th>Session</th>
-        </tr>
-      </thead>
-      <tbody>${rows}</tbody>
-    </table>
-  `;
-}
+    @app.get("/api/bench")
+    async def api_bench_list():
+        """Returns all strategies on the strategy bench."""
+        from trainer.core.bench import StrategyBenchStore
+        store = StrategyBenchStore()
+        return JSONResponse({'strategies': store.get_all()})
 
-// ── DRAW EQUITY CURVE ─────────────────────────────────
-function drawEquityCurve() {
-  const canvas = document.getElementById('equity-canvas');
-  if (!canvas) return;
-  const ctx    = canvas.getContext('2d');
-  const W      = canvas.offsetWidth  || 400;
-  const H      = canvas.offsetHeight || 200;
-  canvas.width  = W;
-  canvas.height = H;
+    @app.post("/api/bench/deploy")
+    async def api_bench_deploy(body: CommandRequest):
+        """
+        Deploy an approved bench candidate to active_strategy.json.
+        Enforces Part E Mutual Exclusion.
+        """
+        if _trainer.get_status().get('running'):
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot deploy bench candidate while Trainer is running. Stop Trainer first."
+            )
 
-  ctx.clearRect(0, 0, W, H);
+        strategy_id = body.strategy_id or body.reason
+        if not strategy_id:
+            raise HTTPException(status_code=400, detail="Missing strategy_id in request body")
 
-  if (!equityCurve || equityCurve.length < 2) {
-    ctx.fillStyle = '#444';
-    ctx.font      = '13px system-ui';
-    ctx.textAlign = 'center';
-    ctx.fillText(
-      'No equity data yet', W/2, H/2
-    );
-    return;
-  }
+        from trainer.core.bench import StrategyBenchStore
+        store = StrategyBenchStore()
 
-  const values = equityCurve.map(p => p.equity);
-  const minVal = Math.min(...values);
-  const maxVal = Math.max(...values);
-  const range  = maxVal - minVal || 1;
-  const pad    = { t:10, r:10, b:30, l:60 };
-  const chartW = W - pad.l - pad.r;
-  const chartH = H - pad.t - pad.b;
+        ok = store.deploy(strategy_id, STRATEGY_PATH.parent)
+        if not ok:
+            return JSONResponse({'ok': False, 'message': f"Strategy '{strategy_id}' not found on bench"})
 
-  const xScale = i => pad.l + (i / (values.length-1)) * chartW;
-  const yScale = v => pad.t + (1 - (v-minVal)/range) * chartH;
+        write_audit_event('BENCH_STRATEGY_DEPLOYED', f"Deployed strategy {strategy_id} from bench",
+                          {'strategy_id': strategy_id})
 
-  // Grid lines
-  ctx.strokeStyle = '#2a2d3e';
-  ctx.lineWidth   = 1;
-  for (let i = 0; i <= 4; i++) {
-    const y = pad.t + (i/4) * chartH;
-    ctx.beginPath();
-    ctx.moveTo(pad.l, y);
-    ctx.lineTo(W - pad.r, y);
-    ctx.stroke();
+        # If Engine is running, perform graceful restart so it picks up the new strategy immediately
+        lock = get_engine_lock_info()
+        restarted = False
+        if lock is not None:
+            pid = lock['pid']
+            ok, stop_msg = graceful_stop_engine(pid, f"Redeploying to strategy {strategy_id}")
+            if not ok:
+                write_audit_event('BENCH_DEPLOY_RESTART_FAILED', stop_msg, {'strategy_id': strategy_id, 'pid': pid})
+                return JSONResponse({
+                    'ok': True,
+                    'message': f"Strategy '{strategy_id}' deployed to bench, but engine stop failed: {stop_msg}. Relaunch aborted to prevent dual process.",
+                    'restarted': False
+                })
+            new_pid = _spawn_engine(lock.get('symbol', 'EURUSD'))
+            restarted = new_pid is not None
+            if not restarted:
+                write_audit_event('BENCH_DEPLOY_RESTART_FAILED', 'Engine spawn failed after stop', {'strategy_id': strategy_id})
 
-    const val = maxVal - (i/4) * range;
-    ctx.fillStyle  = '#555';
-    ctx.font       = '10px system-ui';
-    ctx.textAlign  = 'right';
-    ctx.fillText('$' + val.toFixed(0), pad.l - 4, y + 4);
-  }
+        return JSONResponse({
+            'ok': True,
+            'message': f"Strategy '{strategy_id}' deployed successfully." + (" Engine restarted." if restarted else ""),
+            'restarted': restarted
+        })
 
-  // Determine colour — green if profitable
-  const profitable = values[values.length-1] >= values[0];
-  const lineColor  = profitable ? '#4caf50' : '#f44336';
-  const fillColor  = profitable
-    ? 'rgba(76,175,80,0.12)' : 'rgba(244,67,54,0.12)';
+    # ── ENGINE COMMANDS ─────────────────────────────────
 
-  // Fill area
-  ctx.beginPath();
-  ctx.moveTo(xScale(0), yScale(values[0]));
-  values.forEach((v,i) => ctx.lineTo(xScale(i), yScale(v)));
-  ctx.lineTo(xScale(values.length-1), H - pad.b);
-  ctx.lineTo(pad.l, H - pad.b);
-  ctx.closePath();
-  ctx.fillStyle = fillColor;
-  ctx.fill();
+    @app.post("/api/command/engine/start")
+    async def cmd_engine_start(body: CommandRequest):
+        """Tier 1 — 1-click Engine startup when offline. Enforces Mutual Exclusion with Trainer."""
+        if _trainer.get_status().get('running'):
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot start Engine while Trainer pipeline is running. Wait for Trainer to finish or stop it first."
+            )
+        lock = get_engine_lock_info()
+        if lock is not None:
+            return JSONResponse({'ok': False, 'message': f'Engine is already running (PID {lock["pid"]})'})
 
-  // Line
-  ctx.beginPath();
-  ctx.strokeStyle = lineColor;
-  ctx.lineWidth   = 2;
-  values.forEach((v,i) => {
-    if (i === 0) ctx.moveTo(xScale(i), yScale(v));
-    else         ctx.lineTo(xScale(i), yScale(v));
-  });
-  ctx.stroke();
+        symbol = body.symbol or 'EURUSD'
+        new_pid = _spawn_engine(symbol)
+        if new_pid is None:
+            write_audit_event('ENGINE_START_FAILED', 'Could not spawn engine subprocess', {})
+            return JSONResponse({'ok': False, 'message': 'Could not spawn engine subprocess'})
 
-  // Start/end labels
-  ctx.fillStyle  = '#888';
-  ctx.font       = '10px system-ui';
-  ctx.textAlign  = 'left';
-  ctx.fillText(
-    '$' + values[0].toFixed(0),
-    pad.l + 2, yScale(values[0]) - 4
-  );
-  ctx.textAlign = 'right';
-  ctx.fillText(
-    '$' + values[values.length-1].toFixed(0),
-    W - pad.r,
-    yScale(values[values.length-1]) - 4
-  );
-}
+        write_audit_event('ENGINE_START_CONFIRMED', 'Engine launched', {'new_pid': new_pid})
+        return JSONResponse({'ok': True, 'message': f'Engine started (PID {new_pid})', 'pid': new_pid})
 
-// ── UTILITIES ─────────────────────────────────────────
-function setText(id, text) {
-  const el = document.getElementById(id);
-  if (el) el.textContent = text;
-}
+    @app.post("/api/command/engine/stop")
+    async def cmd_engine_stop(body: CommandRequest):
+        """Tier 1 — Graceful SIGTERM stop."""
+        pid = find_engine_pid()
+        if pid is None:
+            return JSONResponse({'ok': False, 'message': 'Engine is not running'})
+        reason = body.reason or 'Dashboard stop command'
+        ok, msg = graceful_stop_engine(pid, reason)
+        return JSONResponse({'ok': ok, 'message': msg, 'pid': pid})
 
-function setCard(id, cls) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  el.className = 'stat-card ' + cls;
-}
+    @app.post("/api/command/engine/kill")
+    async def cmd_engine_kill(body: CommandRequest):
+        """Tier 3 — Hard kill. Confirmation phrase enforced at API layer."""
+        if body.confirmation_phrase != KILL_PHRASE:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Hard kill requires exact confirmation phrase: '{KILL_PHRASE}'"
+            )
+        lock = get_engine_lock_info()
+        if lock is None:
+            return JSONResponse({'ok': False, 'message': 'Engine is not running'})
+        pid = lock['pid']
+        started_at = lock.get('started_at', '')
+        reason = body.reason or 'Dashboard hard kill command'
+        ok, msg = hard_kill_engine(pid, reason, started_at)
+        return JSONResponse({'ok': ok, 'message': msg, 'pid': pid})
 
-// ── STARTUP ───────────────────────────────────────────
-fetchStatus();
-fetchEquity();
-fetchTrades();
+    @app.post("/api/command/engine/restart")
+    async def cmd_engine_restart(body: CommandRequest):
+        """
+        Tier 2 — Graceful stop then relaunch.
+        SAFE_MODE override also routes here (Option A: clear via restart).
+        Enforces Mutual Exclusion with Trainer.
+        """
+        if _trainer.get_status().get('running'):
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot restart Engine while Trainer pipeline is running. Stop the Trainer first."
+            )
+        reason = body.reason or 'Dashboard restart command'
+        lock = get_engine_lock_info()
 
-// Poll every 5 seconds
-setInterval(fetchStatus, 5000);
-setInterval(fetchEquity,  30000);  // equity less frequent
-setInterval(fetchTrades,  10000);
+        if lock is not None:
+            pid = lock['pid']
+            write_audit_event('ENGINE_RESTART_REQUESTED', reason, {'pid': pid})
+            ok, stop_msg = graceful_stop_engine(pid, reason)
+            if not ok:
+                write_audit_event('ENGINE_RESTART_FAILED', stop_msg, {'pid': pid})
+                return JSONResponse({'ok': False, 'message': f'Stop failed: {stop_msg}'})
+        else:
+            write_audit_event('ENGINE_RESTART_REQUESTED', reason, {'note': 'engine_was_stopped'})
 
-// Redraw chart on resize
-window.addEventListener('resize', drawEquityCurve);
-</script>
-</body>
-</html>"""
+        # Relaunch
+        symbol = lock.get('symbol', 'EURUSD') if lock else body.symbol
+        new_pid = _spawn_engine(symbol)
+        if new_pid is None:
+            write_audit_event('ENGINE_RESTART_FAILED', 'Could not spawn engine subprocess', {})
+            return JSONResponse({'ok': False, 'message': 'Engine stopped but relaunch failed'})
+
+        write_audit_event('ENGINE_RESTART_CONFIRMED', 'Engine relaunched', {'new_pid': new_pid})
+        return JSONResponse({'ok': True, 'message': f'Engine restarted (PID {new_pid})'})
+
+    @app.post("/api/command/engine/clear_safe_mode")
+    async def cmd_clear_safe_mode(body: CommandRequest):
+        """
+        Tier 2 — Clear SAFE_MODE via graceful restart (Option A).
+        Enforces Mutual Exclusion with Trainer.
+        """
+        if _trainer.get_status().get('running'):
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot clear SAFE_MODE while Trainer pipeline is running. Stop the Trainer first."
+            )
+        reason = body.reason or 'SAFE_MODE override — graceful restart'
+        cusum  = read_json_safe(CUSUM_PATH)
+        state  = read_json_safe(STATE_PATH)
+        meta = {
+            'cusum_tripped':   cusum.get('cusum_tripped'),
+            'cusum_reason':    cusum.get('cusum_reason'),
+            'circuit_breaker': state.get('circuit_breaker_tripped'),
+            'override_reason': reason,
+        }
+        write_audit_event('SAFE_MODE_OVERRIDE_REQUESTED', reason, meta)
+        lock = get_engine_lock_info()
+        if lock is not None:
+            ok, stop_msg = graceful_stop_engine(lock['pid'], reason)
+            if not ok:
+                write_audit_event('SAFE_MODE_OVERRIDE_FAILED', stop_msg, meta)
+                return JSONResponse({'ok': False, 'message': f'Stop failed: {stop_msg}'})
+        symbol = lock.get('symbol', 'EURUSD') if lock else body.symbol
+        new_pid = _spawn_engine(symbol)
+        if new_pid is None:
+            write_audit_event('SAFE_MODE_OVERRIDE_FAILED', 'Engine relaunch failed', meta)
+            return JSONResponse({'ok': False, 'message': 'Engine stopped but relaunch failed'})
+        write_audit_event('SAFE_MODE_OVERRIDE_CONFIRMED',
+                          'Engine restarted — SAFE_MODE cleared on init',
+                          {**meta, 'new_pid': new_pid})
+        return JSONResponse({'ok': True,
+                             'message': f'Engine restarted (PID {new_pid}). SAFE_MODE cleared.'})
+
+    @app.post("/api/command/engine/reload_strategy")
+    async def cmd_reload_strategy(body: CommandRequest):
+        """Existing Tier 1 — Engine picks up strategy file changes on next candle close."""
+        return JSONResponse({
+            'ok':      True,
+            'command': 'reload_strategy',
+            'message': 'Engine will reload strategy on next candle close.',
+        })
+
+    # ── TRAINER COMMANDS ────────────────────────────────
+
+    @app.post("/api/command/trainer/run")
+    async def cmd_trainer_run(body: CommandRequest):
+        """Tier 1 — Launch a Trainer run (halts at STAGED, no auto-deploy). Enforces Mutual Exclusion."""
+        if get_engine_lock_info() is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot launch Trainer while Engine is running live. Stop the Engine first."
+            )
+        try:
+            result = _trainer.launch(symbol=body.symbol, quick=body.quick)
+            write_audit_event('TRAINER_RUN_LAUNCHED', 'Dashboard trainer launch',
+                              {'pid': result['pid'], 'symbol': body.symbol})
+            return JSONResponse({'ok': True, **result})
+        except RuntimeError as e:
+            return JSONResponse({'ok': False, 'message': str(e)})
+
+    @app.post("/api/command/trainer/stop")
+    async def cmd_trainer_stop(body: CommandRequest):
+        """Tier 2 — SIGTERM the Trainer subprocess."""
+        reason = body.reason or 'Dashboard trainer stop'
+        pid = _trainer.get_pid()
+        write_audit_event('TRAINER_STOP_REQUESTED', reason, {'pid': pid})
+        ok = _trainer.stop()
+        action = 'TRAINER_STOP_CONFIRMED' if ok else 'TRAINER_STOP_FAILED'
+        write_audit_event(action, '' if ok else 'stop failed', {'pid': pid})
+        return JSONResponse({'ok': ok, 'message': 'Trainer stopped' if ok else 'Stop failed'})
+
+    # ── LEGACY COMMAND ROUTE ────────────────────────────
+
+    @app.post("/api/command/{command}")
+    async def api_command(command: str):
+        """Legacy endpoint — only reload_strategy supported for backwards compat."""
+        if command == 'reload_strategy':
+            return JSONResponse({'status': 'ok', 'command': command,
+                                 'message': 'Engine will reload strategy on next candle close.'})
+        raise HTTPException(status_code=400,
+                            detail=f"Unknown command '{command}'. "
+                                   f"Use /api/command/engine/* or /api/command/trainer/*")
 
 
-# ── ENTRY POINT ────────────────────────────────────────
+# ── ENGINE SPAWNER ──────────────────────────────────────
+
+_engine_proc: Optional[subprocess.Popen] = None
+_engine_lock  = threading.Lock()
+
+def _spawn_engine(symbol: str = 'EURUSD') -> Optional[int]:
+    """
+    Spawn a new Engine subprocess. Returns the PID or None on failure.
+    Note: spawning is best-effort; the dashboard does not monitor the child long-term.
+    Engine itself writes engine.lock.json on startup.
+    """
+    global _engine_proc
+    try:
+        cmd = [sys.executable, '-m', 'engine.core.engine', '--symbol', symbol]
+        with _engine_lock:
+            _engine_proc = subprocess.Popen(
+                cmd,
+                cwd=str(ATS_ROOT),
+                # Don't capture output — Engine writes its own log files
+            )
+        log.info(f"Engine spawned: PID {_engine_proc.pid} symbol={symbol}")
+        return _engine_proc.pid
+    except Exception as e:
+        log.error(f"Failed to spawn Engine: {e}")
+        return None
+
+
+# ── ENTRY POINT ──────────────────────────────────────────
+
 if __name__ == '__main__':
     if not FASTAPI_AVAILABLE:
-        print("Install FastAPI first:")
-        print("  pip install fastapi uvicorn")
+        print("FastAPI not available. Run: pip install fastapi uvicorn")
         sys.exit(1)
 
-    print("\nATS Engine Dashboard")
-    print("=" * 40)
-    print("URL:  http://localhost:8080")
-    print("API:  http://localhost:8080/api/status")
-    print("Stop: Ctrl+C")
-    print("=" * 40 + "\n")
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s | %(levelname)s | %(message)s',
+    )
 
     uvicorn.run(
         app,
-        host='127.0.0.1',  # localhost only — not exposed
+        host='127.0.0.1',
         port=8080,
-        log_level='warning'
+        log_level='info',
     )
