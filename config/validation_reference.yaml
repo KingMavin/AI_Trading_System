@@ -1,0 +1,29 @@
+# Independent financial calculations to validate Backtester math.
+# PnL values are verified against manual hand-calculations based on MT5 formulas.
+EURUSD:
+  trade_1:
+    direction: BUY
+    lots: 1.0
+    entry_price: 1.10000
+    exit_price: 1.10100
+    entry_time: '2024-01-01T12:00:00Z' # Monday
+    exit_time: '2024-01-02T12:00:00Z'  # Tuesday
+    expected:
+      gross_pnl: 100.0  # 10 pips * $10
+      commission: -7.0
+      swap_cost: -5.0   # 1 rollover * -5.0
+      net_pnl: 88.0
+
+XAUUSD:
+  trade_1:
+    direction: SELL
+    lots: 0.5
+    entry_price: 2300.00
+    exit_price: 2290.00
+    entry_time: '2024-01-02T12:00:00Z' # Tuesday
+    exit_time: '2024-01-04T12:00:00Z'  # Thursday
+    expected:
+      gross_pnl: 500.0  # 1000 ticks * 1.0 tick_value * 0.5 lots
+      commission: -3.5  # 0.5 * -7.0
+      swap_cost: 30.0   # (1 [Tue] + 3 [Wed]) * 0.5 * 15.0
+      net_pnl: 526.5

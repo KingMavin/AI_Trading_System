@@ -1,0 +1,388 @@
+ADAPTIVE TRADING SYSTEM
+Product Requirements Document
+Version 3.0  —  Final Personal Build Edition
+
+
+
+
+1. Vision & Guiding Philosophy
+
+The Adaptive Trading System (ATS) is a personal, modular, automated trading system built on MetaTrader 5. Its purpose is to generate consistent, risk-controlled returns that grow over time through disciplined strategy refinement — not through leverage abuse, overtrading, or chasing quick profits.
+The system is designed for a single principle: survive first, profit second. A system that never blows up will always have another opportunity. A system that chases returns will eventually lose everything.
+
+Guiding Principles
+Separation of concerns: The Trainer never touches live money. The Engine never modifies itself. These rules are absolute and architectural — not guidelines.
+Capital-agnostic design: All position sizing is equity-percentage based. The system behaves identically on a $200 account and a $200,000 funded account. Scaling is automatic.
+Risk before reward: Capital preservation is the primary objective. Every design decision that conflicts with this principle is resolved in favour of risk control.
+Asynchronous improvement: The Trainer and Engine operate independently on separate machines. Strategy updates are promoted manually via file transfer — not live retraining. The Engine never learns while trading.
+Transparency and auditability: Every trade decision is logged with full context and is explainable in plain English. No black boxes in Phase 1.
+Patient, incremental progress: Complexity is added only after simpler versions are proven stable through paper trading. The temptation to skip steps is the primary risk to this project.
+Hardware-aware execution: The Engine is lean and runs comfortably on the trading PC. The Trainer is portable and can be moved to a higher-spec machine for intensive training runs.
+Session-aware trading: The system understands that forex markets behave differently across trading sessions (Asian, London, New York). Every candle evaluation includes session context.
+
+
+2. System Architecture
+
+The ATS has a strict one-way, asynchronous architecture. Data flows in one direction. Control flows in one direction. The two primary components — Engine and Trainer — never run simultaneously on the same machine and never communicate in real time.
+
+High-Level Data Flow
+MT5 delivers market data to the Engine on candle close.
+The Engine evaluates the candle, makes a trade decision, executes if criteria are met, and writes a structured log record.
+Log files accumulate on the trading PC throughout the day.
+The user periodically transfers log files to the Trainer machine (daily or as needed).
+The Trainer ingests new logs, merges them with historical data, runs walk-forward validation, scores candidate strategies, and flags the best for review.
+The user reviews the candidate strategy report and paper trading results, then manually promotes the strategy by copying the JSON file to the Engine's strategy folder.
+The Engine detects the new file on next startup, validates the DNA hash, and begins trading with the updated strategy.
+
+
+Component Overview
+
+
+3. Trading Engine — Detailed Specification
+
+The Engine is a lightweight Python process that runs on the trading PC during market hours. It is the only component that connects to MT5 and the only component that places real orders. It is intentionally simple, deterministic, and hardened against failure.
+
+3.1 Startup Sequence
+Every time the Engine starts — whether fresh or after a crash — it executes the following sequence in strict order before any market evaluation begins:
+Load configuration file (config.yaml). Validate all required fields are present.
+Load the active strategy JSON file. Compute SHA-256 hash of the parameters block. Compare against the stored dna_hash field. If mismatch: refuse to start, log error, alert dashboard.
+Connect to MT5. Verify connection with a ping. If connection fails after 3 retries: halt and alert.
+Reconcile open positions: query MT5 for all open positions. Compare against last session's log. Log any discrepancies. Do not close positions automatically — flag for user review.
+Verify data freshness: request the last closed candle. Check timestamp is within expected range. If stale: enter waiting state, do not trade.
+Log startup event with: timestamp, strategy ID, DNA hash, symbol, timeframe, account equity, connection status.
+Notify dashboard: Engine online. Begin candle close monitoring.
+
+3.2 Pre-Trade Checklist
+This is a new component in v3.0. Before acting on any entry signal, the Engine runs a structured checklist. Every item must pass. If any item fails, the entry is skipped and the skip reason is logged.
+
+
+The checklist result (all items + pass/fail status) is written to every candle log record. This makes debugging failed entries straightforward.
+
+3.3 Candle Close Processing Loop
+The Engine operates on a single event: candle close. It wakes only when a new candle completes on the primary timeframe. Between candles, it idles with minimal CPU usage.
+
+Detect candle close event by polling MT5 at configurable interval (default: every 10 seconds). Candle close is confirmed when a new candle appears in the OHLCV series.
+Fetch OHLCV data for primary timeframe (last 500 candles) and secondary timeframe if defined (last 200 candles).
+Calculate all indicators defined by the active strategy template. See Section 3.4 for full indicator list.
+Classify market regime using ADX, ATR, and MA position. Log result.
+Detect current trading session. Log result.
+Run pre-trade checklist (Section 3.2). Log full checklist result.
+If all checklist items pass: evaluate strategy entry/exit logic. Generate signal (BUY / SELL / HOLD).
+If signal is BUY or SELL and no conflicting position exists: calculate position size using equity-percentage formula. Submit order to MT5 with SL and TP.
+Manage existing open positions: check if SL or TP has been hit (MT5 handles this), apply any trailing stop logic defined by the strategy.
+Write full candle log record (see Section 5.3 for schema).
+Update dashboard data feed.
+Return to idle until next candle close.
+
+3.4 Indicator Library
+All indicators are calculated using pandas-ta on closed OHLCV data. The Engine and Trainer use identical calculation functions from a shared indicators module (indicators.py). This guarantees backtest-to-live consistency.
+
+
+3.5 Order Execution
+All order placement follows a strict sequence to minimise slippage and ensure proper risk sizing.
+
+Calculate position size: Risk Amount = Equity × risk_per_trade_pct. Stop Loss Distance (pips) = ATR × sl_atr_multiple. Lot Size = Risk Amount / (SL pips × pip value per lot).
+Round lot size to broker's minimum lot step (typically 0.01). Cap at maximum allowed by hard risk limits.
+Fetch current bid/ask. Verify spread ≤ max_spread_pips. If not: abort (logged as SKIP_SPREAD).
+Set entry price, SL, TP. Submit order via MT5 Python library.
+Verify order confirmation from MT5. Log execution price, requested price, slippage, commission.
+If order rejected by MT5: log rejection reason. Do not retry automatically. Alert dashboard.
+
+3.6 Session Awareness Layer
+This is a new component in v3.0. Forex markets have distinct behavioural characteristics across trading sessions. The session layer provides context to every candle evaluation and can be used as a filter condition in strategy files.
+
+
+Each candle log record includes a session_label field. Strategy files can define allowed_sessions as a list. The pre-trade checklist checks this field. Strategies left with allowed_sessions: null trade across all sessions except the Dead Zone (which is always blocked by default).
+
+3.7 Failure Recovery Protocol
+Every failure scenario has a defined automatic response. There is no undefined state.
+
+
+
+4. Real-Time Dashboard — Detailed Specification
+
+The dashboard is the primary monitoring and control interface for the Engine. It is a local web application served by the Engine process, accessible via any browser on the same machine or local network. It replaces Telegram as the main interface. Telegram remains active for critical-only fallback alerts.
+
+4.1 Technical Architecture
+Backend: FastAPI (Python) running as part of the Engine process. Exposes a REST API and a WebSocket feed for live data.
+Frontend: Single-page application built in React (Vite). Connects to the WebSocket for real-time updates. Falls back to 5-second polling if WebSocket connection drops.
+Serving: Accessed via http://localhost:8080 by default. Configurable port. Local network access enabled via config flag.
+Authentication: Optional single-password protection (configurable). No user accounts needed for personal use.
+No external services: Dashboard runs fully offline. No cloud dependency.
+
+4.2 Dashboard Panels — Full Specification
+
+Panel 1: System Status Bar (always visible, top of screen)
+Engine state indicator: RUNNING (green) / PAUSED (amber) / SAFE MODE (red) / OFFLINE (grey).
+MT5 connection state: CONNECTED / DISCONNECTED with time since last successful ping.
+Active strategy: Name, version, DNA hash (truncated to 8 chars), template type.
+Current symbol and timeframe.
+Last candle close timestamp and time until next expected candle.
+Data freshness indicator: FRESH / STALE with seconds since last candle.
+
+Panel 2: Account Overview
+Current equity (updates on every candle close).
+Current balance.
+Open P&L (unrealised, updates every 5 seconds from MT5 quotes).
+Daily P&L: profit/loss since 00:00 UTC today.
+Weekly P&L and Monthly P&L (running totals from logs).
+Drawdown gauge: current drawdown from peak equity shown as percentage and colour-coded bar (green < 5%, amber 5–10%, red > 10%).
+Peak equity and date of peak.
+
+Panel 3: Risk Gauges
+Daily loss used: progress bar showing cumulative daily loss vs daily limit (e.g., 2.1% of 5.0% used).
+Drawdown used: current drawdown vs max drawdown limit.
+Positions used: current open positions vs max (e.g., 1 of 3).
+Degradation status: NORMAL / WARNING with rolling 20-trade performance metric displayed.
+
+Panel 4: Open Positions
+
+Panel 5: Trade History (current session)
+Table of all closed trades since Engine startup: symbol, direction, lots, entry price, exit price, P&L, duration, exit reason (SL/TP/manual), strategy ID.
+Running total P&L for the session.
+Win rate for the session.
+
+Panel 6: Indicator Snapshot
+Current values of all active indicators for the trading symbol on the primary timeframe.
+Visual representation: MA lines shown as above/below price; RSI shown as gauge; Bollinger Band width shown as bar.
+Current session label and regime label with confidence note.
+Pre-trade checklist status: shows each of the 9 checklist items with PASS/FAIL for the most recent candle evaluation.
+
+Panel 7: Alert Feed
+Chronological log of all system events: trades, warnings, errors, checklist skips, kill switch activations, connection events.
+Colour coded: green (trade executed), amber (warning/skip), red (error/halt), blue (info).
+Each entry shows: timestamp, event type, detail message.
+Persistent until manually cleared. Survives browser refresh (stored in Engine memory).
+
+Panel 8: Remote Controls
+Pause Engine: halts new order evaluation after current candle completes. Open positions remain. Resume via same button.
+Emergency Close All: immediately closes all open positions at market. Requires confirmation dialog.
+Reload Strategy: prompts Engine to reload the strategy file from disk on next candle. Use after manually updating the strategy file.
+Reset Safe Mode: available only when Engine is in safe mode after a max drawdown breach. Requires typed confirmation ('RESET') to prevent accidental activation.
+Force Daily Reset: manually reset the daily loss counter (for testing only — locked in production mode).
+
+4.3 Telegram Fallback
+Telegram alerts are sent only for critical events that require immediate attention regardless of whether the user is watching the dashboard.
+
+
+5. Data Pipeline & Logging — Detailed Specification
+
+5.1 Historical Data Pipeline
+Historical data is the foundation of all backtesting and walk-forward validation. It must be clean, consistent, and stored in a format that loads quickly on the Trainer machine.
+
+Download
+Source: MT5 history API via MetaTrader5 Python library.
+Instruments: EURUSD, GBPUSD, USDJPY (Phase 1). XAUUSD added in Phase 2.
+Timeframes: M15 (primary), H1 (confirmation), H4 (regime context). M5 available but not used in Phase 1.
+Range: 2015-01-01 to present. Incremental updates add only new candles.
+Script: download_history.py. Accepts symbol, timeframe, start date as arguments. Idempotent — safe to re-run.
+
+Storage Format
+Format: Parquet files via pyarrow. One file per symbol per timeframe (e.g., EURUSD_M15.parquet).
+Columns: timestamp (UTC, datetime64), open, high, low, close, volume (tick volume), spread.
+Compression: Snappy. Balances read speed and file size.
+Index: timestamp. Sorted ascending. No gaps allowed — missing candles are flagged and interpolated or documented.
+Location: data/historical/{symbol}/{timeframe}.parquet
+
+Data Quality Checks
+Gap detection: flag any gaps longer than 3× the timeframe interval (excluding weekends).
+Duplicate detection: deduplicate on timestamp before saving.
+OHLC sanity: assert high >= max(open,close) and low <= min(open,close) on every row.
+Volume check: flag zero-volume candles (common during low liquidity). Log count; do not remove.
+
+5.2 Live Log Transfer
+The Engine writes log files to logs/live/{YYYY-MM-DD}.jsonl on the trading PC.
+Transfer method: user manually copies or syncs the logs/ folder to the Trainer machine. A sync script (sync_logs.py) is provided for convenience.
+Frequency: daily minimum. More frequent transfers give the Trainer more recent data.
+The Trainer ingests new log files on each training run. Already-processed files are skipped (tracked by a processed_logs.json manifest).
+
+5.3 Candle Log Schema (v1)
+Every candle close evaluation produces one log record. The schema is versioned. Adding fields is backwards-compatible. Removing or renaming fields requires a schema version bump.
+
+
+
+6. Trainer — Detailed Specification
+
+The Trainer is an offline research environment. It runs on the user's highest-available machine. It is fully portable: clone the repository, run pip install -r requirements.txt, and it is ready. No server, no database, no external dependencies.
+
+6.1 Portability Requirements
+All dependencies declared in requirements.txt. No optional system-level dependencies.
+All data stored in portable formats: Parquet, CSV, JSON, JSON-Lines. No database server.
+All paths configured via a single config file (trainer_config.yaml). No hardcoded paths.
+Fully functional offline after initial data download. No internet required for training runs.
+Compatible with Windows 10/11 and Ubuntu 20.04+. Tested on both.
+Memory-safe: all large dataset operations use chunked loading or Parquet column projection to stay within RAM limits.
+
+6.2 Training Run Sequence
+Load configuration: instruments, timeframes, training window parameters, strategy templates to test.
+Ingest historical data: load Parquet files for all configured symbols and timeframes.
+Ingest live logs: scan logs/ directory for new .jsonl files not in processed_logs.json manifest. Parse, validate schema version, merge with historical data. Update manifest.
+For each strategy template: run walk-forward validation (see Section 7).
+Score all walk-forward results using composite metric (see Section 9).
+Check strategy degradation monitor against current production strategy (see Section 6.5).
+Identify candidates that beat promotion criteria (see Section 9.3).
+Generate promotion report: full walk-forward stats, regime breakdown, comparison to production strategy, paper trading recommendation.
+Export candidate strategy JSON files to candidates/ directory.
+Log training run summary to training_runs/ directory.
+
+6.3 Adaptation System
+The Trainer uses a three-stage structured search process to find improved strategy configurations. This replaces the vague 'mutation' concept from earlier versions with a precise, bounded, and explainable process.
+
+Stage 1 — Parameter Search
+For each strategy template, search the bounded parameter space to find the highest-scoring configuration on the optimisation window.
+Method: Grid search for parameter spaces with fewer than 500 combinations. Random search with Bayesian refinement (via scikit-optimize) for larger spaces.
+Objective: Composite Score on the optimisation window (in-sample). Not Calmar alone — prevents overfitting to return at the cost of drawdown.
+Bounds: Defined in a bounds config file per template. No parameter can be set outside its bounds. Bounds are designed to keep strategies logically coherent (e.g., fast MA period must always be less than slow MA period).
+Output: Top 10 parameter sets per template, ranked by in-sample composite score. All 10 proceed to Stage 2.
+
+Stage 2 — Filter Testing
+For each top parameter set from Stage 1, test the marginal effect of adding or removing filters. Only filters that improve out-of-sample performance on a held-out validation window are retained.
+Session filter: test restricting trading to specific sessions. Test all combinations of the 7 session windows defined in Section 3.6.
+Volatility filter: test restricting trading to candles where ATR is within [min_atr_multiple, max_atr_multiple] × average ATR.
+Trend strength filter: test requiring ADX > threshold before entry (values: 20, 25, 30).
+Spread filter: already in pre-trade checklist. Optimise max_spread_pips threshold here.
+Each filter is tested independently. Combinations of two filters are tested if individual tests show improvement. No more than two filters combined in Phase 1.
+
+Stage 3 — Template Combination
+Test whether combining the entry logic of one template with the exit logic of another produces a better strategy than either alone.
+Rules: Entry and exit must operate on the same primary timeframe unless the combination is explicitly designed as multi-timeframe. Maximum 2 templates combined in Phase 1.
+Coherence check: before running any combination, a rule checker validates that the entry and exit logic are not contradictory (e.g., RSI overbought entry combined with RSI overbought exit would immediately close the position — this is flagged and skipped).
+Combinations that pass coherence check are treated as new templates and must pass full walk-forward validation independently before being considered for promotion.
+
+6.4 Parameter Bounds Reference
+
+6.5 Strategy Degradation Monitor
+This is a new component in v3.0. The PRD previously described how a strategy gets promoted but said nothing about detecting when a live strategy starts to fail. This component fills that gap.
+
+How It Works
+After each trade closes, the Engine computes a rolling composite score over the last 20 closed trades.
+This rolling score is compared against the strategy's baseline composite score recorded at promotion time (stored in the strategy JSON file under walk_forward_summary.baseline_composite_score).
+If the rolling score drops below degradation_threshold_pct (default: 60%) of the baseline score for 5 consecutive trade evaluations: the Engine logs WARNING_DEGRADATION and alerts the dashboard with a persistent banner.
+The Engine does not halt automatically on degradation. The user decides whether to pause the Engine, load a different strategy, or continue monitoring.
+Degradation resets automatically if the rolling score recovers above the threshold for 10 consecutive evaluations.
+
+Degradation Thresholds
+
+6.6 Jupyter Sandbox — Defined Structure
+The Jupyter Sandbox is a defined set of notebooks, not an unstructured dumping ground. Each notebook has a specific purpose and a standard structure. New analysis should go into the appropriate notebook.
+
+
+
+7. Walk-Forward Validation — Full Specification
+
+Walk-forward validation is the core quality gate of the entire system. It is the difference between a strategy that looks good on historical data and one that might actually work in live markets. Every candidate strategy must pass walk-forward before it can be considered for promotion.
+
+7.1 Why Walk-Forward
+Standard backtesting optimises a strategy on a dataset and measures performance on the same dataset. This produces overfit strategies that perform beautifully in backtests and fail immediately in live trading. Walk-forward validation prevents this by always testing on data that was never seen during optimisation.
+
+7.2 Window Configuration
+
+7.3 Walk-Forward Process (Step by Step)
+Define the full date range: start = earliest available data, end = most recent data minus 1 month (preserve last month for final paper trade validation).
+Set window pointer to start.
+Define optimisation window: [pointer, pointer + 6 months).
+Run parameter search (Stage 1 of Adaptation System) on optimisation window. Select best parameter set by composite score.
+Define test window: [pointer + 6 months, pointer + 7 months).
+Apply the best parameter set from step 4 to the test window. Run backtest. Record all metrics: Calmar, Sharpe, Profit Factor, Max Drawdown, Win Rate, Avg Win/Loss, Trade Count, Regime label for this window.
+Advance pointer by 1 month. Repeat from step 3 until test window end exceeds available data.
+Aggregate all test window results: compute mean, median, and worst-case for each metric across all windows.
+Compute regime breakdown: separate performance stats for windows labelled TRENDING, RANGING, VOLATILE, QUIET.
+Apply promotion criteria (Section 9.3) to aggregated results. Mark as CANDIDATE or REJECTED with reason.
+Write full walk-forward report to candidates/{strategy_id}_wf_report.json.
+
+7.4 Data Leakage Prevention
+Data leakage — where test data influences the optimisation — is the most common way walk-forward validation produces misleadingly good results. The Trainer enforces these rules:
+Strict window isolation: the optimisation function receives only data within [opt_start, opt_end). It cannot access any data after opt_end. This is enforced by slicing the DataFrame before passing to any optimisation function.
+Indicator lookback: indicators require historical candles before they produce valid values (e.g., a 200-period SMA needs 200 candles of warmup). The Trainer includes a warmup buffer of 300 candles before each window start, used only for indicator calculation, never for trade evaluation.
+No peeking: strategies cannot reference future candle data. All evaluations use only closed candles. This is verified by the candle-close-only architecture of the shared Engine/Trainer simulation function.
+Walk-forward test: as a sanity check, the Trainer verifies that best parameters change across optimisation windows. If every window produces identical best parameters, this is a sign of either a very robust strategy or insufficient search — flagged in the report.
+
+
+8. Strategy File Specification
+
+The strategy file is the contract between the Trainer and the Engine. It is a JSON file that completely defines how the Engine should trade. The Engine loads this file and applies it exactly. Nothing about Engine behaviour can be changed except by updating this file.
+
+8.1 DNA Hash
+The DNA hash is a SHA-256 hash computed over a canonical JSON serialisation of the parameters and filters objects (keys sorted alphabetically, no whitespace). It uniquely identifies a strategy configuration.
+Computed by the Trainer when exporting a candidate strategy file.
+Verified by the Engine on every startup. If the file's dna_hash does not match a fresh computation of the parameters block, the Engine refuses to start.
+If the user manually edits any parameter in the file, the hash will mismatch and the Engine will refuse to load it. To make changes, the user must run the Trainer's re-hash utility (rehash_strategy.py) which recomputes the hash and requires manual confirmation.
+The hash is stored in full (64 hex characters). The dashboard displays only the first 8 characters for readability.
+
+8.2 Complete Field Reference
+
+
+9. Performance Metrics & Promotion Criteria
+
+9.1 Metric Definitions
+
+9.2 Composite Score Formula
+
+
+9.3 Promotion Criteria — All Must Pass
+
+Promotion is always a manual human decision. The Trainer flags candidates. The user reads the full walk-forward report (candidate review notebook), reviews the paper trading log, and makes the promotion decision. No candidate is ever automatically deployed.
+
+
+10. Risk Management — Full Specification
+
+Risk management is the most important section of this document. The system's long-term success depends more on what it prevents than on what it achieves. Every rule here is a hard limit in the Engine. No strategy file can override them.
+
+10.1 Capital-Agnostic Position Sizing
+The system sizes every position as a percentage of current equity. This means:
+A $500 account risks the same percentage per trade as a $50,000 funded account.
+As equity grows, position sizes grow proportionally. As equity shrinks, position sizes shrink, naturally reducing exposure during drawdowns.
+The dollar amount risked per trade is never hard-coded. It is always calculated at order time.
+
+Position Size Formula
+
+10.2 Hard-Coded Engine Risk Limits
+
+10.3 Prop Firm Mode
+When prop_firm_mode: true is set in the strategy file, the Engine applies additional limits on top of the hard limits above. These are calibrated for typical prop firm challenge rules.
+
+
+11. Phase 1 Milestones — Detailed
+
+Each milestone is a gate. The next milestone does not begin until the current one is fully complete, tested, and documented. Skipping gates is the primary failure mode of this type of project.
+
+Milestone 0 — Data Pipeline
+
+Milestone 1 — Single Strategy Backtester
+
+Milestone 2 — Walk-Forward Validation
+
+Milestone 3 — Live Engine + Dashboard + Paper Trading
+
+Milestone 4 — Additional Strategy Templates
+
+Milestone 5 — Trainer Automation & Promotion Pipeline
+
+
+12. Technology Stack
+
+
+
+13. Non-Functional Requirements
+
+
+
+14. Market Regime Detection
+
+Regime detection is mandatory. It runs on every candle close in both the Engine and the Trainer. Its purpose is to provide context for every trade decision and to allow strategies to be tested and filtered by the market conditions they are designed for.
+
+
+In Phase 1, the Engine logs the detected regime but does not automatically switch strategy files based on regime. The strategy file's regime_target field controls whether the Engine skips entry signals in the wrong regime. Automatic regime-based strategy switching is a Phase 2 feature.
+
+
+15. Future Phases
+
+
+
+16. Glossary
+
+
+
+END OF DOCUMENT — ATS PRD v3.0
+Next Step: Milestone 0 — Data Pipeline
+Build the foundation before anything else. Do not skip ahead.

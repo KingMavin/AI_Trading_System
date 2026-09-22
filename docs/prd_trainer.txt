@@ -1,0 +1,164 @@
+ADAPTIVE TRADING SYSTEM
+TRAINER PRD
+Product Requirements Document — Offline Strategy Discovery & Validation
+
+
+Table of Contents
+
+0. Changelog — v1.0 → v2.0
+This section is the authoritative record of every correction, addition, and decision made while implementing v1.0 and reviewing the result. Items are grouped by severity. Each references the section where the corrected requirement is specified in full.
+0.1 Critical Corrections (Validity of Results)
+0.2 Important Corrections (Methodology & Reliability)
+0.3 New Requirements (Not Present in v1.0)
+
+1. Trainer Overview & Philosophy
+The Trainer is the offline strategy discovery and validation component of the Adaptive Trading System. It runs on a schedule or on demand, never touches live money, and communicates with the Engine exclusively through a deployed strategy file. Its job is to search for strategy configurations that show genuine — not merely apparent — out-of-sample edge, and to make an honest promotion, flag, or rejection decision for each.
+Absolute Laws
+The Trainer never places real orders and never connects to a live trading account.
+The Trainer's only interface to the Engine is the strategy file it writes — never direct memory or process communication.
+Every promotion decision must be reproducible: same data + same config + same code version must produce the same verdict.
+[NEW] The Trainer must defend against its own ability to fool itself — multiple-testing correction, leak-free data splits, and degenerate-config rejection are treated as core correctness requirements, not refinements.
+[NEW] An unattended overnight run must never crash the host machine and must never lose more than one unit of progress (one window/candidate) if interrupted.
+2. Pipeline Architecture
+The Trainer is structured as 10 sequential layers, run in strict order for each symbol in a training run. The pipeline is orchestrated by a single entry point so that 'run the Trainer' is always one reproducible command.
+Stage 4 of Layer 6 (Pattern Discovery) remains explicitly deferred: it raises NotImplementedError by design and activates only once 500+ live trades are available from the Engine, at which point the expanded trade-feature logging specified in the Engine PRD §11.6 will provide sufficient signal.
+3. Trainer Configuration & Run Modes
+A single configuration object defines symbols, templates, date ranges, optimisation/test window lengths, and the parameter grid for a run. Two standard profiles exist:
+Both profiles read OUTPUT_ROOT, ACCOUNT_CURRENCY, and resource-governor limits from the shared configuration module described in §4.4 — none of these are hardcoded inside the run profiles themselves.
+4. Layer 1: Pipeline Orchestrator
+4.1 Execution Sequence
+For each configured symbol, the orchestrator runs Layers 2 through 9 in strict order, writes a per-symbol Run Record, and only then proceeds to the next symbol. A single concurrency lock prevents two Trainer runs from executing simultaneously against the same knowledge base.
+4.2 Layer Failure Handling
+If a layer fails for a given symbol, the orchestrator records the failure on the Run Record, logs the full error, and — [CHANGED] — continues to the next symbol rather than aborting the entire run. A partial run that completes EURUSD and GBPUSD but fails on USDCAD is more valuable than no results at all, and is now the default behaviour.
+4.3 Run Record
+Every run produces a Run Record capturing: run ID, configuration used, per-layer status and timing, candidates tested, promotion outcomes, and a pointer to the persistent report (§13). The Run Record is appended to the knowledge base's run history.
+4.4 Output Location & Configuration Module [NEW]
+Every Trainer module reads paths from this single configuration object. No module constructs an absolute path independently — this is what makes the system portable if a second machine is ever used, and it is also simply good hygiene for a system that will run unattended for hours.
+5. Data Manager & Layer 2: Data Ingestion
+5.1 Data Source Tiers
+5.2 Broker-Time Correction at Ingestion [CHANGED]
+Layer 2 applies the same DST-aware broker-time → UTC conversion specified in Engine PRD §4.5 before any timestamp is persisted to Parquet.
+All previously-built Parquet files must be rebuilt from source CSVs under this corrected logic before any new training run is treated as authoritative.
+The data-quality checker's gap detection (weekend/holiday-aware) is unaffected by this correction in its logic, only in the timestamps it operates on, and must be re-run after rebuild to reconfirm zero critical issues.
+5.3 Data Quality Checks
+Unchanged in design from v1.0: duplicate-timestamp detection, OHLC sanity checks (high ≥ max(open,close), low ≤ min(open,close)), holiday-and-weekend-aware gap detection, and a minimum-history requirement (3 years) before an instrument is eligible for training.
+5.4 Per-Instrument Training Start Dates [CHANGED / NEW]
+5.5 Live Log Ingestion
+The Trainer reads Engine-written trade logs (JSON-Lines, one file per day) via a TrainerManifest that tracks which files have already been merged, preventing duplicate ingestion across runs. [CHANGED] Because SL/TP-detected closes are now logged by the Engine (Engine PRD §10.9), live ingestion reflects complete trade outcomes rather than only signal-based exits.
+6. Layer 3-4: Feature Engineering & Simulation Engine
+6.1 Feature Categories
+Category A — Indicator features (SMA/EMA, RSI, ATR, ADX, Bollinger Bands, MACD).
+Category B — Context features (session, regime, hour, day-of-week).
+Category C — Market structure features (distance from recent high/low, volatility ratio).
+Category D — Discovery features, reserved for Phase 3 pattern discovery; schema defined now so Engine logging (Engine PRD §11.6) is already compatible when this activates.
+6.2 Simulation Engine — Cost Model [CHANGED]
+The backtester's per-trade cost model now consists of four components instead of three:
+6.3 Intracandle Fill Model
+Unchanged from v1.0: a conservative fill model checks the stop-loss side of a candle's range before the take-profit side, on the assumption that we cannot know intracandle sequencing from OHLC data alone — this biases every backtest slightly pessimistic rather than slightly optimistic, which is the correct direction to err.
+6.4 Look-Ahead Safety
+[NEW REQUIREMENT] Every signal generated for candle i must be computable using only data available at or before candle i's close. This is treated as a testable invariant (see §14.3), not just a design intention.
+6.5 Performance Optimisation
+Indicator calculation is vectorised across the full dataset once per backtest rather than recomputed per-candle in a loop; the simulation loop itself uses array/itertuples-based iteration rather than DataFrame.iterrows() for the order-of-magnitude speed difference this provides — material given the hardware constraint in §11.
+6.6 Instrument Specification [CHANGED — CRITICAL]
+The Simulation Engine consumes the same InstrumentSpec object specified in Engine PRD §6.9 — tick_size, tick_value, contract_size, digits, point, stops_level, swap_long/short, currency fields — sourced from a live MT5 capture and cached, never hardcoded per-symbol constants inside the backtester. This is the change that makes USDJPY, USDCAD, and XAUUSD all simulate correctly, and is the same fix described in the Engine document — implemented once in shared code, consumed by both Trainer and Engine, never duplicated.
+XAUUSD's live tick_value must be re-captured during market hours before this instrument is trained against — the one weekend snapshot taken so far is flagged as anomalous (see Engine PRD §6.9).
+6.7 Swap / Financing in Backtests [NEW]
+Every simulated trade held open across a broker daily rollover boundary accrues the relevant swap_long or swap_short value, converted using the same tick_value basis as P&L. For XAUUSD specifically — where observed swap_long is roughly 25x GBPUSD's — this is not an optional refinement; ignoring it would make every gold backtest materially optimistic for any strategy that holds overnight.
+7. Layer 5-7: Coherence Validator, Adaptation System, Walk-Forward
+7.1 Coherence Validator [NEW LAYER]
+Before any candidate proceeds to walk-forward, it is checked against rejection rules including:
+Stop-loss distance so tight relative to typical instrument noise that it would trigger on effectively every entry.
+Filter combinations so restrictive that fewer than a minimum number of trades would be expected over the test period.
+Parameter combinations that are logically invalid for the template (e.g. fast moving-average period ≥ slow period).
+Take-profit / stop-loss ratios outside a sane bound for the instrument's typical volatility.
+Rejected candidates are logged with the specific rule that triggered rejection and never reach Layer 7.
+7.2 Adaptation System — Three Stages (Unchanged in Structure)
+7.3 Stage 1 Refinement — Prefer Plateaus, Not Peaks [CHANGED]
+After scoring the grid (or Bayesian samples), the selection step now also scores the local neighbourhood around each top candidate.
+A candidate surrounded by similarly-scoring neighbours (a plateau) is preferred over a higher-scoring isolated spike, all else being roughly equal.
+This preference is logged explicitly on the candidate record so it is visible in the persistent report (§13) which candidates were selected for plateau stability versus raw score.
+7.4 Stage 2 Refinement — Held-Out Leak Closed [CHANGED — CRITICAL]
+The dataset is now partitioned into three disjoint regions per training run: optimisation window(s) for Stage 1/2 parameter and filter selection, a separate held-out window used only for Stage 2's filter-improvement check, and the walk-forward OOS windows used in Layer 7 — with no overlap between the filter-selection held-out region and any walk-forward OOS region.
+This partitioning is validated programmatically at the start of each run (date ranges checked for overlap) rather than relied upon by convention.
+7.5 Walk-Forward Validator — Candidate Fidelity [CHANGED — CRITICAL]
+Walk-forward's role is now fixed as pure out-of-sample validation of a given, fixed candidate configuration:
+Walk-forward receives one fully-specified CandidateConfig (template, symbol, parameters, filters) as input.
+For each rolling window, the candidate's fixed parameters are applied unchanged to the optimisation slice purely to confirm the candidate remains tradeable in that period (trade count, no coherence violation) — no re-optimisation occurs.
+The same fixed parameters are then applied to the subsequent out-of-sample test slice, and that result is what is recorded as the window's OOS outcome.
+This is run once per candidate the Adaptation System promotes to validation, not once per grid cell — which is also a substantial compute saving over v1.0's behaviour.
+8. Layer 9: Knowledge Base & Memory
+8.1 Deduplication
+Candidates are keyed by a SHA-256 hash of (template, symbol, timeframe, parameters, filters) combined with a data hash representing the exact dataset version tested. A candidate is only treated as 'already tested' if both hashes match — new data always forces a retest even if parameters are identical.
+8.2 Parameter & Filter Insight Tracking
+The knowledge base tracks, per template/symbol/parameter, which values have historically scored well, with a confidence level (LOW/MEDIUM/HIGH) based on sample count. This informs Bayesian search starting points in future runs but never overrides the current run's own evidence.
+8.3 Storage Location [CHANGED]
+The knowledge base file and its rolling backups now live under D:\work\files\knowledge_base, governed by the same OUTPUT_ROOT configuration as all other Trainer output (§4.4).
+9. Layer 8: Scoring & Promotion
+9.1 Hard Gates
+Eight hard gates must all pass before a candidate is eligible for composite scoring. [CHANGED] Gate 7 (maximum consecutive losses) is corrected to read its source value from the field the walk-forward result object actually populates — confirmed by an explicit integration test (§14.1) rather than relying on a unit test of the gate function in isolation.
+9.2 Composite Score — Single Formula [CHANGED]
+There is now exactly one composite-score function, used by every stage of the pipeline (Stage 1 candidate ranking, walk-forward window scoring, and final promotion scoring). Its weights:
+9.3 Calmar Ratio Annualisation Fix [CHANGED]
+Annualised return is now computed from actual elapsed wall-clock time between the first and last equity-curve observation in the evaluated period, not from a candle-count proxy. Where the evaluated period is too short for a stable annualisation (a configurable minimum), the Calmar component is capped and flagged rather than allowed to produce an extreme, misleading value.
+9.4 Multiple-Testing Correction [NEW — CRITICAL]
+Two complementary mechanisms are introduced:
+Trial-count tracking: every run records the total number of configurations evaluated for a given symbol/template/period. This count is stored on the candidate record and surfaced in the persistent report (§13) so a human reviewer always sees how many trials produced the winning score.
+Score deflation: the composite score used for the final promotion decision is adjusted downward as a function of the number of trials evaluated to reach it — a candidate that emerged as the best of 5 trials is treated more favourably than an equally-scored candidate that emerged as the best of 500.
+The exact deflation function (e.g. a Bonferroni-style adjustment or a permutation-based threshold) is an implementation decision to be finalised during the build of this section; the requirement that some such correction exists and is never bypassed is fixed.
+9.5 Prop-Firm-Aware Penalty [NEW]
+Independent of aggregate profitability, a candidate's walk-forward results are scanned for the single worst observed daily loss and the single worst trailing drawdown across all OOS windows. If either would breach a configured prop-firm rule profile (see Engine PRD §13.3), the candidate's composite score receives an explicit penalty, and the flag is surfaced in the promotion decision's reasoning text — a strategy can be profitable in aggregate and still unsuitable for prop deployment, and the Trainer's output must say so plainly rather than hide it inside an aggregate number.
+9.6 Promotion Decision Paths
+Unchanged in structure from v1.0: AUTO_PROMOTE, FLAG_REVIEW, AUTO_REJECT, with first-run thresholds distinct from subsequent-run improvement-over-baseline thresholds. [CHANGED] The decision record now also carries the trial count (§9.4) and prop-rule flag (§9.5) so a human reviewing a FLAG_REVIEW decision has the full picture, not just the final number.
+10. Multi-Instrument Support
+10.1 USDCAD
+Quote currency CAD — P&L requires conversion via the broker-reported tick_value, exactly as for USDJPY; no separate conversion logic is written per-instrument, the InstrumentSpec abstraction in §6.6 handles all of them uniformly.
+Recommended training start: 2005 (§5.4). Expect and explicitly review regime behaviour around the 2014-16 oil price collapse and 2020, since CAD is materially oil-correlated.
+10.2 XAUUSD (Gold)
+Not an FX pair — 100oz contract, 2-digit pricing, materially wider and more variable spread than the FX majors, and an overnight swap cost roughly an order of magnitude larger than any FX pair tested (§6.7).
+Recommended training start: 2009 (§5.4).
+Must not be trained against until its live tick_value is re-verified during market hours (§6.6, Engine PRD §6.9) — the one capture taken so far is flagged as anomalous and is not trustworthy as a sizing basis.
+11. Resource Management & Crash-Safety for Unattended Runs [NEW SECTION]
+11.1 Process Pool
+Backtests are CPU-bound, so the executor uses a process pool (not threads, which would be blocked by Python's GIL for this workload).
+Worker count is capped at (logical cores − 1) by default, leaving the OS and an interactive session responsive, and is itself configurable.
+Each worker is handed only the pre-sliced data it needs for its specific window/candidate — never the full multi-hundred-thousand-row historical dataset — to control per-worker memory footprint under Windows' process-spawn model.
+Worker processes run at reduced OS priority so the host machine remains usable for anything else running on it.
+11.2 RAM Watchdog
+Free memory is polled periodically during a run. If free memory drops below a configured floor, the governor reduces active worker count before the OS is forced to intervene.
+11.3 Disk-Space Watchdog
+Free space on the OUTPUT_ROOT drive is checked before every write. Below a configured floor, the Trainer stops accepting new work gracefully — completing and checkpointing in-flight work rather than crashing on a failed write — and, where possible, compresses older log files to reclaim space automatically.
+11.4 Checkpointing & Resume [CRITICAL]
+Progress is checkpointed to D:\work\files\checkpoints after every completed window or candidate evaluation, using an atomic write (temp file + rename) so a checkpoint file is never left in a half-written state.
+On startup, the Trainer checks for an incomplete run's checkpoint and offers to resume from the last completed unit of work rather than restarting the entire run.
+Checkpoint granularity is deliberately fine (per-window, per-candidate) rather than per-symbol, so the maximum possible loss from an unclean shutdown is bounded to a single unit of work, not hours of it.
+11.5 Per-Task Exception Isolation
+A single backtest or window raising an unexpected exception is caught, logged with full context, and skipped — it must never propagate up and terminate the entire overnight run.
+11.6 Practical Guidance for Unattended Operation
+Windows power settings must be configured to prevent system sleep for the duration of an overnight run — a sleeping process is not a crashed process, but it does silently halt progress and skew elapsed-time-based logic if not accounted for.
+All of the above (process pool, watchdogs, checkpointing) are designed around the explicit assumption that no human will intervene mid-run; nothing in the run path may require interactive input once started.
+12. Determinism & Reproducibility
+Every backtest owns its own seeded random number generator instance; no logic relies on a global/shared seed, which would make results order-dependent under parallel execution.
+Given the same code version, the same data hash, and the same configuration, a run must produce the same composite scores — this is treated as a testable property (§14.4), not an assumption.
+Key library versions (numpy, pandas, pandas_ta) are pinned, since minor differences in floating-point behaviour between versions can shift indicator values slightly and silently invalidate the knowledge base's config+data-hash deduplication, which assumes identical inputs produce identical outputs.
+13. Report Generator [NEW LAYER]
+Every completed training run produces a persistent, human-reviewable report saved to D:\work\files\reports — never only printed to a console that scrolls away. The report includes, at minimum:
+Run configuration (symbols, period, templates, grid size, trial count per symbol).
+Per-candidate results: composite score, trial-adjusted score (§9.4), hard-gate pass/fail detail, prop-rule flag status (§9.5), and the plateau-vs-peak selection note (§7.3).
+The final promotion decision and its full reasoning text, exactly as written to the decision log.
+A summary of any layer failures or skipped symbols (§4.2) so a partial run's gaps are visible at a glance.
+Disk space and run duration at completion, to validate the resource-governor assumptions in §11 over time.
+14. Test Suite Requirements [CHANGED / NEW]
+The existing test suite proves component-level mechanics but has a structural weakness: it exercises functions in isolation and does not test the seams between them — which is exactly where Gate 7 (§9.1) went undetected. The following categories close that gap and are required before any v2.0-logic run is trusted with a real promotion decision.
+14.1 Integration-Seam Tests [NEW]
+An end-to-end test that runs real walk-forward window results through aggregation, then through hard-gate checking, then through composite scoring, then through promotion — asserting on the final decision, not on any single function's isolated output. This is the test that would have caught the dead Gate 7.
+14.2 Financial-Correctness Tests [NEW]
+A test that hand-computes the expected P&L for a known trade on each of the five instruments (including a USDJPY, a USDCAD, and an XAUUSD example) and asserts the backtester's output matches to the cent/pip, in the account's actual currency.
+14.3 Look-Ahead-Bias Test [NEW]
+A test that perturbs data after candle i and asserts the signal generated at candle i is unchanged — proving no future information leaked into a past decision.
+14.4 Reproducibility Test [NEW]
+A test that runs the same small job twice, end to end, and asserts identical composite scores — protecting the determinism property in §12.
+14.5 Golden-Path Signal Test [CHANGED]
+Existing signal-engine tests assert only that a signal is structurally valid on randomised data. A deterministic test using a hand-constructed price series with a known crossover at a known bar, asserting the exact signal direction, stop-loss price, and take-profit price, is added alongside the existing tests — not as a replacement for them.
+14.6 Held-Out Partition Test [NEW]
+A test that asserts the optimisation window, the filter-selection held-out window, and the walk-forward OOS windows for a given run configuration are mutually non-overlapping date ranges — enforcing §7.4 programmatically rather than by convention.
+15. Open Items Before Trusting a Real Promotion Decision

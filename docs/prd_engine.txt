@@ -1,0 +1,187 @@
+ADAPTIVE TRADING SYSTEM
+ENGINE PRD
+Product Requirements Document — Live Trading Engine
+
+
+Table of Contents
+
+0. Changelog — v1.0 → v2.0
+This section is the authoritative record of every correction, addition, and decision made during the build-and-review phase. Every item below was identified by implementing v1.0 against real broker data and real hardware constraints. Each item references the section of this document where the corrected requirement is specified in full.
+0.1 Critical Corrections (Money / Risk)
+0.2 Important Corrections (Correctness / Reliability)
+0.3 New Requirements (Not Present in v1.0)
+
+1. Engine Overview & Philosophy
+The Trading Engine is the live execution component of the Adaptive Trading System. It is a lightweight, always-on Python process that connects to MetaTrader 5, evaluates market conditions on every candle close, and executes pre-validated strategies under strict risk controls.
+The Engine is intentionally simple and deterministic. It does not learn, adapt, or modify its own strategy. It executes exactly what the loaded strategy file defines, under exactly the risk limits configured, and logs everything it does for the Trainer to analyse.
+Absolute Laws
+The Engine loads strategy files. It never writes or modifies them.
+The Engine executes on candle close only. No tick-level evaluation.
+The Engine is deterministic. Same market data + same strategy file = identical decisions every time.
+The Engine never modifies itself. All adaptation happens in the Trainer, offline.
+The Engine never pyramids. One position per symbol per direction in Phase 1.
+The Dead Zone (21:00–00:00 broker-time-converted-to-UTC) is always blocked. No configuration can override this.
+CLOSE signals always bypass non-safety risk checks. Nothing prevents closing a position for risk reasons.
+MT5 is always the source of truth for account values, open positions, and fills. Internal calculations are secondary and must reconcile against MT5, never replace it.
+[NEW] All money math (pip value, position size, P&L) is derived from broker-reported InstrumentSpec values at runtime — never hardcoded constants.
+[NEW] The Engine never assumes its own account currency. It reads it from MT5 and converts every financial calculation explicitly.
+2. Engine Architecture
+The Engine is a single Python process structured as 10 sequential layers. Data flows through the layers in strict order on every candle close. No layer can be skipped. No layer executes out of order.
+2.1 10-Layer Processing Stack
+Layer 7 (Position Management) runs before Layer 4 (Signal Generation) on each candle. This ensures positions closed by management logic — including broker-side SL/TP fills, now correctly detected — free up slots before new entry signals are evaluated.
+2.2 Candle Processing Order (Every Candle)
+Layer 1: Detect and confirm new closed candle; convert broker time to true UTC.
+Layer 2: Fetch updated OHLCV data from MT5; verify connection is alive.
+Layer 3: Calculate all required indicators.
+Layer 7: Run position management — reconcile against MT5, detect SL/TP closes, apply BE/trailing/exits.
+Layer 4: Generate entry/exit signal.
+Layer 5: Run pre-trade checklist, including circuit breakers.
+Layer 6: Execute approved orders (closes first, then entries).
+Layer 8: Write all log records to D:\work\files.
+Layer 9: Update dashboard state file.
+Return to Layer 1: sleep until next candle.
+2.3 Engine State Object
+All Engine data lives in one central engine_state object, written exclusively by designated layers and read by all others, the dashboard, and the logger.
+2.4 Output Location [NEW]
+All files the Engine writes — logs, state snapshots, decision records, degradation status — are written under a single configurable OUTPUT_ROOT on the second hard drive, never the primary drive.
+3. Startup Sequence
+Every Engine startup — fresh or after a crash — executes the same sequence in strict order. No trading begins until all steps complete successfully.
+Load and validate config.yaml. Verify all required fields present and within valid ranges. If any field is invalid: halt with a clear error message listing all problems.
+Load active strategy JSON file. Compute SHA-256 hash of the parameters + filters block. Compare against the stored dna_hash field. If mismatch: refuse to start and log STRATEGY_HASH_MISMATCH.
+Detect crash vs. clean shutdown using shutdown_flag.json / state_snapshot.json on D:\work\files.
+Connect to MT5 via mt5.initialize(). Verify with terminal_info() and account_info(). Retry 3 times, 30s apart; halt and log MT5_CONNECTION_FAILED on exhaustion.
+Read account currency and basic account info via mt5.account_info(). [CHANGED] never assume USD — store the returned currency string in engine_state.
+[NEW] Build the InstrumentSpec for the active symbol from live broker data — digits, point, contract size, tick_size, tick_value, volume_min/step/max, stops_level, swap_long, swap_short, currency_base, currency_profit. Never reuse a cached or hardcoded value for these fields.
+[NEW] Cross-check the freshly built InstrumentSpec against a sanity range (e.g. tick_value should be plausible given contract size and point — flag and refuse to trade an instrument whose live spec looks anomalous, as observed once with XAUUSD during a weekend quote).
+Run startup data fetch. Load full history at the configured timeframe. Validate data quality. Apply broker-time→UTC correction before storing in primary_df.
+Pre-calculate all indicators on the full dataset. Confirm warmup: all required indicators must produce non-NaN values on the last candle before trading begins.
+Reconcile open positions with MT5, filtered strictly by this Engine's magic_number. Compare against state_snapshot (crash recovery) or assume a clean slate (fresh start).
+[NEW] Evaluate circuit-breaker state: recompute today's realised + floating P&L and the trailing drawdown from account history. If a breaker was already tripped during downtime, start the Engine in a halted state rather than resuming trading.
+Write shutdown_flag.json to D:\work\files to signal clean state. Log ENGINE_STARTED with full context, including InstrumentSpec and account currency. Begin candle close monitoring.
+4. Layer 1: Candle Close Detection
+The candle close detection loop is the Engine's heartbeat. Every other layer depends on it firing correctly, exactly once per candle, at the right time.
+4.1 Detection Architecture
+The Engine uses precision sleep plus confirmation polling instead of fixed-interval polling, minimising CPU usage while ensuring accurate detection.
+4.2 Detection Loop
+Record expected_next_candle_time on startup = last closed candle timestamp + timeframe duration.
+Precision sleep until expected_next_candle_time minus 2 seconds.
+Begin confirmation polling every 1 second until the new candle is confirmed, or a 60-second timeout elapses.
+Confirm: fetch the last 2 candles from MT5. New candle confirmed when candles[-1].time > last_processed_candle_time.
+4.3 Gap Handling
+If the gap between the last processed candle and the newly confirmed candle exceeds one timeframe interval, the Engine logs a GAP_DETECTED event and processes only the latest closed candle — it does not attempt to replay missed candles synthetically.
+4.4 Stale Candle Timeout
+If no new candle is confirmed within the 60-second polling window, the Engine logs STALE_CANDLE_TIMEOUT and falls through to the connection-health check in §4.6 before retrying.
+4.5 Broker Time → True UTC Conversion [CRITICAL CHANGE]
+Requirements:
+The Engine must determine the live broker UTC offset at startup and on each reconnect, rather than assuming a fixed value — the offset changes with US/EU daylight saving transitions and is not guaranteed identical to the Engine machine's own timezone.
+All candle timestamps stored in primary_df and used for session/regime classification must be true UTC after this conversion — never raw broker time.
+The conversion logic must be unit-testable independent of MT5 connectivity (given a known broker time and a known DST calendar, produce the correct UTC timestamp).
+This same conversion must be applied retroactively when the Trainer rebuilds historical Parquet files, so live and historical session labels are consistent (see Trainer PRD §0.1).
+4.6 Connection Health: Reconnection & Heartbeat [NEW]
+The Engine maintains a last_heartbeat timestamp, updated on every successful MT5 call.
+If no successful MT5 call occurs within a configured timeout, the Engine attempts reconnection via mt5.initialize() with exponential backoff, capped at a maximum retry interval.
+Reconnection attempts and outcomes are logged as RECONNECT_ATTEMPT / RECONNECT_SUCCESS / RECONNECT_FAILED events.
+After a configured number of consecutive failed reconnection attempts, the Engine enters SAFE_MODE: no new entries, existing positions left under broker-side SL/TP protection, and a persistent alert is written to the dashboard state file.
+Stale-data guard: if fetched candle data has a timestamp older than expected given wall-clock time, the Engine treats this as a connection health problem, not a market data problem, and does not generate signals from it.
+5. Layer 2: Data Fetching
+5.1 Fetch Count Calculation
+The Engine fetches enough trailing candles to satisfy the slowest indicator's warmup requirement plus a safety buffer (FETCH_CANDLES, default 300 on M15), ensuring every indicator produces a valid value on the current candle.
+5.2 Startup Fetch
+On startup, the Engine performs a full historical fetch sized to FETCH_CANDLES, applies the broker-time correction from §4.5, validates data quality (no duplicate timestamps, no inverted OHLC), and populates primary_df before any indicator calculation begins.
+5.3 Candle Fetch (Every Candle)
+On each confirmed candle close, the Engine fetches the same trailing window, applies the same UTC correction, and appends/replaces the latest row in primary_df. The DataFrame index is always true UTC.
+6. Layer 3: Indicator Calculation & Instrument Specification
+6.1 Calculation Timing
+Indicators are recalculated once per candle close, immediately after Layer 2 completes, using the shared shared/indicators.py module — the same module used by the Trainer's backtester, guaranteeing identical math between simulation and live execution.
+6.2 Full Indicator Library
+Moving Averages: SMA, EMA
+Oscillators: RSI, MACD
+Volatility: ATR, Bollinger Bands
+Trend: ADX (+DI / -DI)
+Volume: Volume SMA
+Context: Session classification, Regime classification (TRENDING / RANGING / VOLATILE / QUIET / TRANSITIONING)
+Crossover detection: crossed_above / crossed_below, computed from current and previous candle values only — never look-ahead.
+6.3 NaN Handling Rule
+Any candle on which a required indicator returns NaN is treated as a HOLD candle. The Engine never trades on partially warmed-up indicators.
+6.9 Instrument Specification [NEW — CRITICAL]
+The Engine builds an InstrumentSpec object per symbol from live MT5 data at startup and refreshes it daily. Hardcoded per-instrument constants are prohibited anywhere in money-math code.
+Observed live values during specification capture (MetaQuotes-Demo, EUR account, weekend snapshot — to be re-verified live during market hours before any instrument first trades):
+6.10 Account Currency & P&L Conversion [NEW — CRITICAL]
+The Engine reads account currency from mt5.account_info().currency at startup. It is never hardcoded.
+Because broker tick_value is already expressed in account currency, position sizing and live P&L require no manual currency conversion — the Engine uses tick_value directly.
+A single configuration value (ACCOUNT_CURRENCY) governs which conversion path historical/offline tooling uses when account currency must be inferred outside of a live MT5 session; this value defaults to EUR for the current demo and must be set to USD before connecting the prop-firm account.
+No code path may silently assume USD. Any function that performs currency-sensitive math must take account currency as an explicit parameter or read it from InstrumentSpec/account state.
+6.11 Swap / Financing Cost Model [NEW]
+Positions held through the broker's daily rollover incur a swap charge or credit, in points, applied per lot. Observed live values (EUR account, MetaQuotes-Demo):
+XAUUSD's overnight carry is an order of magnitude larger than the FX pairs. Any strategy holding gold positions overnight must account for this cost in both live execution and Trainer backtests (see Trainer PRD §0.2). The Engine logs accrued swap per position at each rollover so the Trainer can reconcile modelled vs. actual carry cost.
+7. Layer 4: Signal Generation
+Signal generation logic, templates (MA Crossover in Phase 1, others reserved for later phases), filter layer, and conflict checking are unchanged from v1.0 in design intent. The only functional change is that all price-distance calculations (stop-loss distance, take-profit distance) now resolve through InstrumentSpec.point rather than an assumed pip size, so they remain correct across 5-digit FX pairs, 3-digit JPY pairs, and 2-digit gold pricing without special-casing in the signal templates themselves.
+8. Layer 5: Pre-Trade Checklist & Circuit Breakers
+The pre-trade checklist gates every entry signal before it reaches order execution. [CHANGED] Two new mandatory checks were added based on review for live and prop-firm-compliant operation; see §13 for full circuit-breaker specification.
+9. Layer 6: Order Execution
+9.1 Execution Sequence
+Closes are always submitted before new entries within the same candle cycle. This frees margin and respects the one-position-per-direction rule before any new order is evaluated.
+9.2 Position Sizing Formula [CHANGED]
+Position size is computed from the account's risk percentage, the strategy's stop-loss distance, and the InstrumentSpec's tick_value — never a hardcoded pip value.
+9.3 Pre-Submission Validator [CHANGED]
+Computed lot size is within [volume_min, volume_max] and aligned to volume_step.
+Stop-loss and take-profit distances both exceed instrument_spec.stops_level — orders that would violate the broker's minimum stop distance are rejected before submission, not after a broker error.
+[NEW] Current spread is checked against a maximum-acceptable-spread threshold immediately before submission — the Engine does not trade through an abnormally wide spread.
+9.4 Order Submission [CHANGED]
+[NEW] A maximum price deviation (slippage tolerance) is set on every market order request — orders are never sent with unlimited slippage tolerance.
+[NEW] Filling mode is negotiated against the symbol's supported modes (IOC / FOK / Return) rather than hardcoded to IOC, since not all brokers/symbols accept IOC.
+All order requests use the Engine's dedicated magic_number for both placement and later identification.
+9.5 MT5 Return Code Handling
+Every order_send result is checked against its retcode. Non-success codes are logged with the full broker comment and the Engine does not assume an order succeeded based on the absence of a Python exception alone.
+9.6 Magic Number Enforcement [CHANGED — CRITICAL]
+Every position query used for reconciliation, management, or exit logic is filtered to magic == self.magic_number.
+Positions on the trading symbol that do not carry the Engine's magic number are logged as FOREIGN_POSITION_DETECTED and are never touched by Engine logic.
+10. Layer 7: Position Management
+10.1 Management Cycle Order
+Reconcile open positions against MT5, filtered by magic_number.
+[NEW] Detect positions that existed last candle but no longer exist — these are SL/TP (or manual broker-side) closes and must be reconstructed and logged (§10.9).
+Apply break-even logic where configured.
+Apply trailing-stop logic where configured.
+Evaluate signal-based exits.
+Apply maximum hold duration and weekend-flat rules.
+10.4 Break-Even Logic
+Unchanged from v1.0 in design: once unrealised profit reaches a configured multiple of the initial risk, the stop-loss is moved to break-even (plus a small buffer to cover round-trip cost).
+10.5 Trailing Stop Logic
+Unchanged from v1.0 in design: once a configured profit threshold is reached, the stop trails price at a configured distance, computed in instrument ticks rather than an assumed pip size.
+10.9 SL/TP Close Detection [NEW — CRITICAL]
+Corrected reconciliation procedure on every candle:
+Compare the set of open position tickets from the previous candle against the current candle's reconciled set (both filtered by magic_number).
+For every ticket present previously but absent now, query mt5.history_deals_get() for that position ticket to retrieve the actual close price, close time, and realised profit.
+Classify the close reason from the deal's reason code / comment (SL hit, TP hit, manual close by user, stopped out by margin) — never assume SL or TP by default.
+Construct a full TradeLogRecord from the reconstructed deal data and write it through the standard logging path (§11), and feed it to the degradation monitor (§12) exactly as a signal-based exit would be.
+This makes the Engine's trade log and degradation monitor complete — covering 100% of trade outcomes, not just the subset closed by signal logic.
+11. Layer 8: Logging
+11.1 Log Streams
+Candle log — one record per processed candle (indicators, session, regime, signal).
+Trade log — one record per closed trade, now including SL/TP-detected closes (§10.9).
+Event log — state transitions, errors, reconnections, circuit-breaker trips.
+Performance log — periodic rollups for the dashboard.
+Error log — full tracebacks for any unhandled exception, isolated per task so one failure does not halt the Engine.
+11.2 Write Method
+All logs are written synchronously and atomically (temp file + rename) to prevent partial/corrupt records if the process is interrupted mid-write.
+11.5 Output Location [CHANGED]
+All five log streams write to D:\work\files\logs, never the primary drive. The Engine checks free disk space before each write and halts gracefully — rather than crashing — if free space drops below a configured floor.
+11.6 Expanded Trade Feature Snapshot [NEW]
+To give the Trainer's future pattern-discovery stage (Phase 3, activates at 500+ live trades) sufficient signal to work with, each trade log record now captures a richer entry-context snapshot than v1.0 specified:
+Logging this now — before there is enough live data for pattern discovery to run — means the historical record will already be rich enough when that stage activates, rather than needing months of additional collection at that point.
+12. Degradation Monitor
+The degradation monitor maintains a rolling window of recent closed trades and compares live performance (profit factor, win rate, consecutive losses) against the walk-forward baseline the Trainer produced for the active strategy. [CHANGED] It now receives every trade close — signal-based and SL/TP-detected — so its assessment reflects complete live performance, not a partial sample.
+When degradation crosses threshold for a configured number of consecutive alerts, the monitor sets rerun_recommended and writes a status file the Trainer reads on its next run, so the search prioritises re-evaluating the currently deployed strategy.
+13. Risk Circuit Breakers & Prop-Firm Compliance [NEW SECTION]
+13.1 Daily Loss Limit
+A configurable maximum daily loss, expressed as a percentage of the day's starting equity, is tracked continuously from daily_start_equity.
+Once realised + floating P&L for the day reaches the negative limit, the Engine immediately blocks new entries for the remainder of the trading day and logs DAILY_LOSS_LIMIT_HIT.
+Existing open positions are not force-closed by this breaker alone — they remain under their own SL/TP — unless the configuration explicitly enables flatten-on-breach.
+13.2 Trailing Maximum Drawdown
+Peak equity is tracked continuously (peak_equity). Trailing drawdown is computed as (peak_equity − equity) / peak_equity.
+Once trailing drawdown reaches the configured limit, the Engine halts all new entries and logs TRAILING_DD_LIMIT_HIT. This persists across restarts via the state snapshot — a breach is not cleared by simply restarting the Engine.
+13.3 Prop-Firm Profile Configuration
+Daily loss limit and trailing drawdown limit are configuration values, not hardcoded constants, so the same Engine build can run against personal-capital risk settings or a specific prop firm's published rule set by loading a different profile.
+13.4 Relationship to Trainer Scoring
+A strategy that is profitable in aggregate but occasionally produces a single large daily loss can still be unsuitable for prop trading even though it passes the Trainer's existing gates. The Trainer's scoring is being updated in parallel (see Trainer PRD §0.1) to penalise strategies whose worst observed daily loss or trailing drawdown would breach a typical prop profile — the Engine's breakers are the last line of defence, not the only one.
+14. Open Items Before Going Live
