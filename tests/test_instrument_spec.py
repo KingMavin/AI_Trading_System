@@ -96,7 +96,24 @@ class TestLotSizing:
     def test_zero_sl_returns_minimum(self):
         spec = make_spec()
         lots = spec.lot_size_for_risk(10000, 1.0, 0.0)
-        assert lots == spec.volume_min
+        assert lots == 0.0
+
+    def test_lot_size_uses_equity_when_provided(self):
+        spec = make_spec(volume_min=0.01, volume_step=0.01, tick_value=1.0, tick_size=1e-5)
+        lots_bal = spec.lot_size_for_risk(account_balance=10000.0, risk_pct=1.0, sl_distance_price=0.0020)
+        lots_eq = spec.lot_size_for_risk(
+            account_balance=10000.0, risk_pct=1.0, sl_distance_price=0.0020, equity=5000.0
+        )
+        assert lots_bal == pytest.approx(0.50)
+        assert lots_eq == pytest.approx(0.25)
+
+    def test_lot_size_ieee754_step_boundary(self):
+        # 1% of 10000 = 100; 290 ticks * 1.1995 ~= 347.855 -> raw_lots ~0.28747
+        # Verify exact multiple of volume_step and clean exact boundary 0.29 / 0.01
+        spec = make_spec(volume_min=0.01, volume_step=0.01, tick_value=1.0, tick_size=1e-5)
+        # 1% of 2900 = 29; 100 ticks * 1.0 = 100 -> raw_lots = 0.29 (IEEE-754 0.29 / 0.01 = 28.999999999999996!)
+        lots = spec.lot_size_for_risk(account_balance=2900.0, risk_pct=1.0, sl_distance_price=0.0010)
+        assert lots == pytest.approx(0.29)
 
     def test_over_risk_returns_zero(self):
         # With a tiny balance and a large enough SL, even the minimum

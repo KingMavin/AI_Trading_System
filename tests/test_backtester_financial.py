@@ -634,3 +634,119 @@ def test_backtester_queued_entry_same_candle_sltp_hit():
     assert trade['close_reason'] == 'SL_HIT'
     assert trade['exit_price'] == 1.0900
 
+
+def test_backtester_equity_based_lot_sizing_and_zero_lot_abort(mock_specs):
+    """
+    Verify _calculate_lot_size and _open_position size from live self.equity
+    and safely abort entry when calculated lots == 0.0.
+    """
+    bt = Backtester("EURUSD", params={'risk_per_trade_pct': 1.0}, initial_equity=10000.0)
+    bt.balance = 10000.0
+    bt.equity = 5000.0
+    lots_eq = bt._calculate_lot_size(sl_price=1.0980, entry_price=1.1000)
+    # 1% of $5,000 equity = $50 risk; 20 pips * $10/pip/lot = $200/lot -> 0.25 lots
+    assert lots_eq == pytest.approx(0.25)
+
+    # Very tiny equity + wide SL should return 0.0 lots and abort without deducting commission
+    bt.balance = 10000.0
+    bt.equity = 10.0
+    bt._open_position(
+        signal={'signal': 'BUY', 'price': 1.1000, 'sl_price': 1.0500, 'tp_price': 1.2000},
+        base_price=1.1000,
+        candle_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        cache={'session': 'LONDON', 'close': 1.1000, 'regime': 'TREND_UP'},
+    )
+    assert bt.open_position is None
+    assert bt.balance == 10000.0
+
+
+def test_backtester_gap_beyond_sl_aborts_open(mock_specs):
+    """Verify _open_position aborts when fill base_price gaps past static SL."""
+    bt = Backtester("EURUSD", params={'risk_per_trade_pct': 1.0}, initial_equity=10000.0)
+    bt._open_position(
+        signal={'signal': 'BUY', 'price': 1.1000, 'sl_price': 1.0950, 'tp_price': 1.1100},
+        base_price=1.0900,
+        candle_time=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        cache={'session': 'LONDON', 'close': 1.1000, 'regime': 'TREND_UP'},
+    )
+    assert bt.open_position is None
+    assert bt.balance == 10000.0
+
+
+def test_backtester_dead_zone_sl_tp_and_equity_curve(mock_specs):
+    """
+    Verify open positions still check SL/TP and record equity_curve/equity_timestamps
+    during DEAD_ZONE candles (22:00 UTC), while blocking new DEAD_ZONE entries.
+    """
+    dates = pd.date_range('2020-01-01 19:00', periods=25, freq='15min', tz='UTC')
+    df = pd.DataFrame({
+        'open':   [1.1000] * 25,
+        'high':   [1.1010] * 25,
+        'low':    [1.0990] * 25,
+        'close':  [1.1000] * 25,
+        'volume': [100.0] * 25,
+    }, index=dates)
+    # Candle 5 (20:15 UTC, NEW_YORK): enter BUY -> opens on candle 6 (20:30 UTC)
+    # Candle 9 (21:15 UTC, DEAD_ZONE, hour>=21): low hits SL=1.0900
+    # Candle 10 (21:30 UTC, DEAD_ZONE): second entry signal should NOT execute in DEAD_ZONE
+    df.iloc[5, df.columns.get_loc('volume')] = 555.0
+    df.iloc[9, df.columns.get_loc('low')] = 1.0850
+    df.iloc[10, df.columns.get_loc('volume')] = 666.0
+
+    class DeadZoneModule:
+        @staticmethod
+        def generate_signal(cache, params):
+            if cache['volume'] in (555.0, 666.0):
+                return {'signal': 'BUY', 'sl_price': 1.0900, 'tp_price': 1.1500}
+            return {'signal': 'HOLD', 'sl_price': None, 'tp_price': None}
+
+        @staticmethod
+        def check_exit(cache, position, params):
+            return {'should_exit': False, 'reason': None}
+
+    bt = Backtester("EURUSD", params={'warmup_candles': 3, 'fast_ma_period': 2, 'slow_ma_period': 3})
+    res = bt.run(df, DeadZoneModule)
+
+    assert len(res['equity_curve']) == 1 + (len(df) - 3)
+    assert len(res['equity_timestamps']) == len(res['equity_curve'])
+    assert dates[9] in res['equity_timestamps']
+    assert len(res['trades']) == 1
+    assert res['trades'][0]['close_reason'] == 'SL_HIT'
+    assert res['trades'][0]['exit_time'] == dates[9]
+
+
+def test_backtester_trade_start_time_warmup_isolation(mock_specs):
+    """Verify signals emitted before trade_start_time warm indicators only and never open trades."""
+    dates = pd.date_range('2020-01-01 08:00', periods=30, freq='15min', tz='UTC')
+    df = pd.DataFrame({
+        'open':   [1.1000] * 30,
+        'high':   [1.1010] * 30,
+        'low':    [1.0990] * 30,
+        'close':  [1.1000] * 30,
+        'volume': [100.0] * 30,
+    }, index=dates)
+    df.iloc[15, df.columns.get_loc('volume')] = 888.0  # during warmup
+    df.iloc[24, df.columns.get_loc('volume')] = 888.0  # active window
+
+    class StartGateModule:
+        @staticmethod
+        def generate_signal(cache, params):
+            if cache['volume'] == 888.0:
+                return {'signal': 'BUY', 'sl_price': 1.0900, 'tp_price': 1.1500}
+            return {'signal': 'HOLD', 'sl_price': None, 'tp_price': None}
+
+        @staticmethod
+        def check_exit(cache, position, params):
+            return {'should_exit': False, 'reason': None}
+
+    bt = Backtester("EURUSD", params={'warmup_candles': 5, 'fast_ma_period': 2, 'slow_ma_period': 3})
+    res = bt.run(df, StartGateModule, trade_start_time=dates[22])
+
+    assert len(res['trades']) == 1
+    assert res['trades'][0]['entry_time'] == dates[25]
+    assert all(
+        e == 10000.0
+        for t, e in zip(res['equity_timestamps'], res['equity_curve'])
+        if t < dates[22]
+    )
+

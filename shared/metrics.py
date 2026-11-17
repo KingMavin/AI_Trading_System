@@ -7,13 +7,17 @@ a single float or dict of floats.
 """
 
 import numpy as np
-import pandas as pd
-from typing import List, Dict
+from typing import List, Dict, Optional
+from datetime import datetime, timezone
 
 
-def calculate_metrics(trades: List[Dict],
-                      equity_curve: List[float],
-                      initial_equity: float = 10000.0) -> Dict:
+def calculate_metrics(
+    trades: List[Dict],
+    equity_curve: List[float],
+    initial_equity: float = 10000.0,
+    window_start: Optional[datetime] = None,
+    window_end: Optional[datetime] = None
+) -> Dict:
     """
     Compute all performance metrics from a list of closed trades.
 
@@ -21,6 +25,8 @@ def calculate_metrics(trades: List[Dict],
         trades:         list of trade dicts (see backtester output)
         equity_curve:   list of equity values at each candle
         initial_equity: starting account equity
+        window_start:   start time of the window
+        window_end:     end time of the window
 
     Returns:
         dict of all computed metrics
@@ -59,18 +65,52 @@ def calculate_metrics(trades: List[Dict],
     # ── Returns ───────────────────────────────────────
     total_return_pct = (net_profit / initial_equity) * 100
 
-    # Annualised return — estimate from trade durations
-    if len(trades) > 0:
-        durations = [t.get('duration_candles', 1) for t in trades]
-        # Assume M15 — 4 candles per hour, 96 per day, 252 trading days
-        total_candles_traded = sum(durations)
-        years = total_candles_traded / (96 * 252)
-        years = max(years, 1/252)  # minimum 1 trading day
-        annualised_return = (
-            (1 + total_return_pct/100) ** (1/years) - 1
-        ) * 100
+    # == Annualised return (Wall-clock elapsed time per AGENTS.md §7) ==
+    def _parse_metric_ts(val, label: str) -> datetime:
+        if isinstance(val, datetime):
+            dt = val
+        elif hasattr(val, 'to_pydatetime'):
+            dt = val.to_pydatetime()
+        elif isinstance(val, str):
+            try:
+                dt = datetime.fromisoformat(val.replace('Z', '+00:00'))
+            except ValueError as exc:
+                raise ValueError(f"Invalid timestamp for {label}: {val!r}") from exc
+        else:
+            raise ValueError(f"Missing or invalid timestamp for {label}: {val!r}")
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+
+    if window_start is not None or window_end is not None:
+        if window_start is None or window_end is None:
+            raise ValueError("Both window_start and window_end must be provided together.")
+        start_dt = _parse_metric_ts(window_start, 'window_start')
+        end_dt = _parse_metric_ts(window_end, 'window_end')
+        time_elapsed = end_dt - start_dt
+        if time_elapsed.total_seconds() < 0:
+            raise ValueError(f"window_end ({end_dt}) precedes window_start ({start_dt}).")
+        years = time_elapsed.total_seconds() / (365.25 * 86400)
     else:
-        annualised_return = 0
+        # Explicit AGENTS.md §7 fallback ONLY when window_start/window_end are both None
+        if not trades:
+            raise ValueError("Cannot compute wall-clock annualisation without window bounds or trades.")
+        try:
+            start_dt = min(_parse_metric_ts(t['entry_time'], 'trade.entry_time') for t in trades)
+            end_dt = max(_parse_metric_ts(t['exit_time'], 'trade.exit_time') for t in trades)
+        except KeyError as exc:
+            raise ValueError(
+                f"Cannot compute wall-clock annualisation: missing required trade timestamp key {exc}."
+            ) from exc
+        time_elapsed = end_dt - start_dt
+        if time_elapsed.total_seconds() < 0:
+            raise ValueError(f"Trade exit_time ({end_dt}) precedes entry_time ({start_dt}).")
+        years = time_elapsed.total_seconds() / (365.25 * 86400)
+
+    years = max(years, 1/252)  # minimum 1 trading day
+    annualised_return = (
+        (1 + total_return_pct/100) ** (1/years) - 1
+    ) * 100
 
     # ── Calmar Ratio ──────────────────────────────────
     calmar = (annualised_return / max_dd_pct

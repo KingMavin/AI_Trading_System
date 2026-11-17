@@ -25,7 +25,7 @@ from typing import Dict, List, Optional
 
 from trainer.core.data_loader import load_ohlcv, get_available_range
 from trainer.core.adaptation import AdaptationSystem, CandidateConfig
-from trainer.core.walk_forward import WalkForwardValidator
+from trainer.core.walk_forward import WalkForwardValidator, get_signal_module
 from trainer.core.scoring import (
     check_hard_gates, calculate_composite_score,
     aggregate_wf_results, rank_candidates
@@ -368,6 +368,9 @@ class TrainerRunner:
                     record: RunRecord,
                     kb: KnowledgeBase) -> tuple:
         """Run the full pipeline for one symbol."""
+        if symbol not in self.mandate.symbol_universe:
+            raise ValueError(f"SYMBOL_NOT_IN_UNIVERSE: {symbol} is not permitted by current mandate.")
+
         config  = self.config
         decisions  = []
         candidates = []
@@ -458,6 +461,7 @@ class TrainerRunner:
                 templates=config['templates'],
                 initial_equity=config['initial_equity'],
                 top_n=config['top_n_candidates'],
+                timeframe=config.get('timeframe', 'M15'),
             )
             candidates = adaptation.run()
             record.candidates_tested = len(candidates)
@@ -503,14 +507,7 @@ class TrainerRunner:
                     f"(score={candidate.composite_score:.3f})"
                 )
 
-                if candidate.template == 'rsi_reversion':
-                    signal_mod = rsi_reversion
-                elif candidate.template == 'donchian_breakout':
-                    signal_mod = donchian_breakout
-                elif candidate.template == 'hybrid_confluence':
-                    signal_mod = hybrid_confluence
-                else:
-                    signal_mod = ma_crossover
+                signal_mod = get_signal_module(candidate.template)
 
                 resolved_test_months = config.get('test_months')
                 if resolved_test_months is None:
@@ -528,9 +525,18 @@ class TrainerRunner:
                     min_trades_test=config['min_trades_test'],
                     mandate=self.mandate,
                     knowledge_base=kb,
+                    anchored=bool(config.get('anchored', False)),
+                    base_params=candidate.filters,
+                    seed_params=candidate.parameters,
+                    timeframe=config.get('timeframe', 'M15'),
                 )
                 wf_windows = wf.run()
                 wf_summary = aggregate_wf_results(wf_windows)
+                wf_summary['template'] = candidate.template
+                wf_summary['symbol'] = symbol
+                wf_summary['timeframe'] = candidate.timeframe
+                wf_summary['filters'] = candidate.filters
+                wf_summary.setdefault('best_params', candidate.parameters)
                 wf_results_by_candidate[
                     candidate.candidate_id
                 ] = (wf_windows, wf_summary)
@@ -602,9 +608,16 @@ class TrainerRunner:
 
                 # Composite score
                 try:
+                    total_trials = max(
+                        1,
+                        int(record.candidates_tested) * int(config.get('wf_trials_per_window', 50)),
+                    )
+                    max_dd_limit = float(self.mandate.max_overall_drawdown_pct) if self.mandate else 8.0
                     score = calculate_composite_score(
                         wf_summary,
                         candidate_id=candidate.candidate_id,
+                        trial_count=total_trials,
+                        max_drawdown_limit_pct=max_dd_limit,
                     )
                     candidate.composite_score = score.composite
                     candidate.scoring_status  = 'OK'
@@ -645,13 +658,20 @@ class TrainerRunner:
                     candidate.candidate_id
                 ]
                 gate = check_hard_gates(
-                    wf_summary, candidate.candidate_id
+                    wf_summary,
+                    candidate.candidate_id,
+                    mandate=self.mandate,
+                    symbol=symbol,
+                    initial_equity=config['initial_equity'],
                 )
 
                 decision = promotion_engine.decide(
                     score=score,
                     wf_summary=wf_summary,
                     gate_result=gate,
+                    template=candidate.template,
+                    symbol=symbol,
+                    timeframe=candidate.timeframe,
                 )
                 decisions.append(decision)
 

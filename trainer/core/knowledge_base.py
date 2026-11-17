@@ -178,7 +178,8 @@ class KnowledgeBase:
                             params: Dict,
                             is_coherent: bool,
                             composite_score: float,
-                            in_sample_regime: str = 'UNKNOWN') -> None:
+                            in_sample_regime: str = 'UNKNOWN',
+                            timeframe: str = 'M15') -> None:
         """Append an Optuna search trial to search_history.jsonl."""
         ignored_keys = {'pip_size', 'risk_per_trade_pct', 'warmup_candles'}
         clean_params = {k: v for k, v in params.items() if k not in ignored_keys}
@@ -188,6 +189,7 @@ class KnowledgeBase:
             'run_id': run_id,
             'template': template,
             'symbol': symbol,
+            'timeframe': timeframe,
             'data_hash': data_hash,
             'trial_number': trial_number,
             'parameters': clean_params,
@@ -206,7 +208,8 @@ class KnowledgeBase:
     def get_top_historical_candidates(self, template: str,
                                        symbol: str,
                                        top_k: int = 5,
-                                       target_regime: str = 'UNKNOWN') -> List[Dict]:
+                                       target_regime: str = 'UNKNOWN',
+                                       timeframe: Optional[str] = None) -> List[Dict]:
         """
         Query search_history.jsonl and candidate_results to return top_k
         historical parameter combinations for (template, symbol) with score > 0.0.
@@ -226,6 +229,7 @@ class KnowledgeBase:
                         rec = json.loads(line)
                         if (rec.get('template') == template and
                                 rec.get('symbol') == symbol and
+                                (timeframe is None or rec.get('timeframe') in (None, 'unknown', timeframe)) and
                                 rec.get('composite_score', -1.0) > 0.0 and
                                 rec.get('is_coherent', True)):
                             score_param = (rec['composite_score'], rec['parameters'])
@@ -240,6 +244,7 @@ class KnowledgeBase:
         for entry in self.data.get('candidate_results', {}).values():
             if (entry.get('template') == template and
                     entry.get('symbol') == symbol and
+                    (timeframe is None or entry.get('timeframe') in (None, 'unknown', timeframe)) and
                     entry.get('composite_score', -1.0) > 0.0):
                 score_param = (entry['composite_score'], entry.get('params_summary', {}))
                 # knowledge_base.json doesn't track regime, put in other

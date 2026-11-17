@@ -77,7 +77,7 @@ class TestDataFoundation:
         })
         monkeypatch.setattr(wf, '_run_one', run_one_mock)
 
-        best_params, score, metrics = wf._optimise(df, window_num=1)
+        best_params, score, metrics = wf._optimise(df, window_num=1, opt_start=df.index[0], opt_end=df.index[-1])
         assert best_params['pip_size'] == 0.01
 
         # Check call arguments passed to _run_one

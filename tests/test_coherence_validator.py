@@ -97,7 +97,7 @@ class TestCoherenceValidator:
         })
         monkeypatch.setattr(wf, '_run_one', run_one_mock)
 
-        best_params, best_score, best_metrics = wf._optimise(df, window_num=1)
+        best_params, best_score, best_metrics = wf._optimise(df, window_num=1, opt_start=df.index[0], opt_end=df.index[-1])
 
         # Confirm _run_one was executed ONLY ONCE (for the single valid parameter set)
         assert run_one_mock.call_count == 1

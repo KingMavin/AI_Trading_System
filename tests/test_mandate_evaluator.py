@@ -123,3 +123,197 @@ class TestMandateEvaluator:
         with pytest.raises(RuntimeError) as exc_info:
             TrainerRunner(quick_mode=True)
         assert "does not exist" in str(exc_info.value)
+
+    def test_mandate_evaluator_prague_midnight_split(self, sample_mandate):
+        # Europe/Prague in January is CET (UTC+1). 
+        # Midnight Prague = 23:00:00 UTC of the previous day.
+        # Limit is 5% daily loss.
+        
+        curve_pass = [
+            # Day 1 (Jan 1st Prague): 22:50 UTC = 23:50 Prague. Equity: 100k -> 97k (3% loss)
+            {'timestamp': '2026-01-01T22:50:00Z', 'equity': 100000},
+            {'timestamp': '2026-01-01T22:55:00Z', 'equity': 97000},  
+            
+            # Day 2 (Jan 2nd Prague): 23:10 UTC = 00:10 Prague. Day rolls over.
+            # Starting equity for Day 2 is 97k. Drops to 93500 (3.6% loss).
+            {'timestamp': '2026-01-01T23:10:00Z', 'equity': 93500},  
+        ]
+        # Passes because Day 1 loss is 3%, Day 2 loss is 3.6%. Neither hits 5%.
+        is_comp, _ = evaluate_backtest_mandate(curve_pass, mandate=sample_mandate)
+        assert is_comp is True
+
+        # Also verify real FTMO 4.0% daily limit with Europe/Prague rollover:
+        # Day 1 (-3.0%): 100k -> 97k; Day 2 (-3.09% of 97k): 97k -> 94k -> passes
+        sample_mandate.max_daily_loss_pct = 4.0
+        curve_ftmo_pass = [
+            {'timestamp': '2026-01-01T22:50:00Z', 'equity': 100000},
+            {'timestamp': '2026-01-01T22:55:00Z', 'equity': 97000},
+            {'timestamp': '2026-01-01T23:10:00Z', 'equity': 94000},
+        ]
+        is_comp, _ = evaluate_backtest_mandate(curve_ftmo_pass, mandate=sample_mandate)
+        assert is_comp is True
+
+        # Same-day 4.2% drop violates 4.0% limit
+        curve_ftmo_fail = [
+            {'timestamp': '2026-01-01T10:00:00Z', 'equity': 100000},
+            {'timestamp': '2026-01-01T15:00:00Z', 'equity': 95800},
+        ]
+        is_comp, reason = evaluate_backtest_mandate(curve_ftmo_fail, mandate=sample_mandate)
+        assert is_comp is False
+        assert "MANDATE_DAILY_LOSS_BREACH" in reason
+
+        sample_mandate.max_daily_loss_pct = 5.0
+        curve_fail = [
+            # Day 1: 100k -> 94.8k (5.2% loss) on a single calendar day
+            {'timestamp': '2026-01-01T10:00:00Z', 'equity': 100000},
+            {'timestamp': '2026-01-01T15:00:00Z', 'equity': 94800},
+        ]
+        is_comp, reason = evaluate_backtest_mandate(curve_fail, mandate=sample_mandate)
+        assert is_comp is False
+        assert "MANDATE_DAILY_LOSS_BREACH" in reason
+
+    def test_mandate_evaluator_drawdown_type(self, sample_mandate):
+        # Initial: 100k -> Peak: 110k -> Drop: 100k
+        # Drop from 110k to 100k is 10k drop. 10k / 110k = 9.09% trailing DD.
+        sample_mandate.max_overall_drawdown_pct = 8.0
+        curve = [
+            {'timestamp': '2026-01-01T10:00:00Z', 'equity': 100000},
+            {'timestamp': '2026-01-05T10:00:00Z', 'equity': 110000},
+            {'timestamp': '2026-01-10T10:00:00Z', 'equity': 100000},
+        ]
+        
+        # Static 8% (from initial) should pass because 100k >= 92k (8% of 100k)
+        is_comp, _ = evaluate_backtest_mandate(curve, mandate=sample_mandate)
+        assert is_comp is True
+        
+        # Trailing 8% should fail because 110k -> 100k is a 9.09% drop (> 8.0%).
+        sample_mandate.drawdown_type = 'trailing'
+        is_comp, reason = evaluate_backtest_mandate(curve, mandate=sample_mandate)
+        assert is_comp is False
+        assert "MANDATE_OVERALL_DD_BREACH" in reason
+
+    def test_mandate_evaluator_rejects_malformed_timestamp(self, sample_mandate):
+        curve = [
+            {'timestamp': '2026-01-01T10:00:00Z', 'equity': 10000.0},
+            {'timestamp': 'not-a-timestamp', 'equity': 10050.0},
+        ]
+        with pytest.raises(ValueError, match="Unparseable ISO timestamp"):
+            evaluate_backtest_mandate(curve, mandate=sample_mandate)
+
+    def test_mandate_evaluator_rejects_missing_timestamp_key(self, sample_mandate):
+        curve = [
+            {'equity': 10000.0},
+            {'equity': 9900.0},
+        ]
+        with pytest.raises(ValueError, match="Missing 'timestamp' key"):
+            evaluate_backtest_mandate(curve, mandate=sample_mandate)
+
+    def test_mandate_evaluator_rejects_non_dict_point(self, sample_mandate):
+        curve = [
+            {'timestamp': '2026-01-01T10:00:00Z', 'equity': 10000.0},
+            "invalid_point",
+        ]
+        with pytest.raises(ValueError, match="Invalid equity curve point"):
+            evaluate_backtest_mandate(curve, mandate=sample_mandate)
+
+    def test_metrics_fails_loudly_without_timestamps(self):
+        from shared.metrics import calculate_metrics
+        with pytest.raises(ValueError, match="wall-clock annualisation"):
+            calculate_metrics([{'net_pnl': 100.0}], [10000.0, 10100.0])
+
+    def test_daily_risk_pct_breach_rejected(self, sample_mandate):
+        curve = [
+            {'timestamp': '2026-01-01T10:00:00Z', 'equity': 10000.0},
+            {'timestamp': '2026-01-02T10:00:00Z', 'equity': 10100.0},
+        ]
+        ok, reason = evaluate_backtest_mandate(curve, mandate=sample_mandate, risk_per_trade_pct=1.0)
+        assert ok is True and reason is None
+
+        bad, reason = evaluate_backtest_mandate(curve, mandate=sample_mandate, risk_per_trade_pct=1.5)
+        assert bad is False
+        assert "MANDATE_DAILY_RISK_BREACH" in reason
+
+        bad_tr, tr_reason = evaluate_backtest_mandate(
+            curve,
+            mandate=sample_mandate,
+            trades=[{'entry_time': '2026-01-01T10:00:00Z', 'risk_pct': 1.2}],
+        )
+        assert bad_tr is False
+        assert "MANDATE_DAILY_RISK_BREACH" in tr_reason
+
+    def test_min_trading_days_breach_and_fail_loud(self, sample_mandate):
+        curve = [
+            {'timestamp': '2026-01-01T10:00:00Z', 'equity': 10000.0},
+            {'timestamp': '2026-01-10T10:00:00Z', 'equity': 10200.0},
+        ]
+        with pytest.raises(ValueError, match="enforce_min_trading_days=True"):
+            evaluate_backtest_mandate(curve, mandate=sample_mandate, enforce_min_trading_days=True)
+
+        two_day_trades = [
+            {'entry_time': '2026-01-01T10:00:00Z'},
+            {'entry_time': '2026-01-02T10:00:00Z'},
+        ]
+        ok_sparse, reason = evaluate_backtest_mandate(
+            curve, mandate=sample_mandate, trades=two_day_trades, enforce_min_trading_days=True
+        )
+        assert ok_sparse is False
+        assert "MANDATE_MIN_TRADING_DAYS_BREACH" in reason
+
+        five_day_trades = [
+            {'entry_time': f'2026-01-0{d}T10:00:00Z'} for d in range(1, 6)
+        ]
+        ok_five, reason = evaluate_backtest_mandate(
+            curve, mandate=sample_mandate, trades=five_day_trades, enforce_min_trading_days=True
+        )
+        assert ok_five is True and reason is None
+
+    def test_gate_9_enforces_min_trading_days_and_risk_at_promotion(self, sample_mandate):
+        from datetime import datetime, timezone, timedelta
+        sample_mandate.min_trading_days = 5
+        sample_mandate.max_daily_loss_pct = 50.0
+        sample_mandate.max_overall_drawdown_pct = 50.0
+        sample_mandate.max_daily_risk_pct = 1.0
+
+        base = datetime(2026, 2, 1, 10, 0, tzinfo=timezone.utc)
+        # 120 trades crammed into 2 calendar days -> violates min_trading_days=5
+        sparse_day_trades = [
+            {
+                'entry_time': base + timedelta(days=i % 2, minutes=i),
+                'exit_time': base + timedelta(days=i % 2, minutes=i + 15),
+                'lots': 0.01,
+                'pnl': 10.0,
+            }
+            for i in range(120)
+        ]
+        summary = {
+            'total_trades': 120,
+            'median_trades_per_window': 25,
+            'valid_windows': 14,
+            'median_max_drawdown_pct': 5.0,
+            'median_profit_factor': 1.8,
+            'profitable_window_rate': 0.80,
+            'max_consecutive_losses': 4,
+            'mandate_compliant': True,
+            'all_oos_trades': sparse_day_trades,
+        }
+        res_days = check_hard_gates(summary, candidate_id='cand_sparse_days', mandate=sample_mandate)
+        assert res_days.passed is False
+        assert res_days.failed_gate == 'gate_9_mandate_compliance'
+        assert "MANDATE_MIN_TRADING_DAYS_BREACH" in res_days.failure_reason
+
+        # Spread across 10 days, but configured risk_per_trade_pct exceeds limit
+        spread_trades = [
+            {
+                'entry_time': base + timedelta(days=i % 10, hours=1),
+                'exit_time': base + timedelta(days=i % 10, hours=2),
+                'lots': 0.01,
+                'pnl': 10.0,
+            }
+            for i in range(120)
+        ]
+        summary['all_oos_trades'] = spread_trades
+        summary['risk_per_trade_pct'] = 1.5
+        res_risk = check_hard_gates(summary, candidate_id='cand_high_risk', mandate=sample_mandate)
+        assert res_risk.passed is False
+        assert res_risk.failed_gate == 'gate_9_mandate_compliance'
+        assert "MANDATE_DAILY_RISK_BREACH" in res_risk.failure_reason

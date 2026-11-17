@@ -463,3 +463,187 @@ class TestAdaptationDataIsolation:
             for c1, c2 in zip(cands1, cands2):
                 assert c1.parameters == c2.parameters
                 assert c1.composite_score == pytest.approx(c2.composite_score, abs=1e-5)
+
+    def test_adaptation_dispatches_non_ma_template_and_propagates_timeframe(self, temp_kb, monkeypatch):
+        """
+        Verify ParameterSearch & FilterTesting dispatch to template signal module
+        (not hardcoded ma_crossover) and propagate timeframe='H1'.
+        """
+        from trainer.core.adaptation import ParameterSearch, FilterTesting
+        from shared.instrument_spec import InstrumentSpec
+        from unittest.mock import patch
+        import trainer.core.adaptation as adapt_mod
+
+        dates = pd.date_range('2020-01-01', periods=320, freq='1h', tz='UTC')
+        closes = 1800.0 + 10.0 * np.sin(np.linspace(0, 8 * np.pi, 320))
+        df = pd.DataFrame({
+            'open': closes - 0.5,
+            'high': closes + 1.0,
+            'low': closes - 1.0,
+            'close': closes,
+            'volume': [100.0] * 320,
+        }, index=dates)
+
+        seen_modules = []
+        orig_get_sig = adapt_mod.get_signal_module
+
+        def spy_get_signal_module(tmpl):
+            mod = orig_get_sig(tmpl)
+            seen_modules.append((tmpl, getattr(mod, '__name__', '')))
+            return mod
+
+        monkeypatch.setattr(adapt_mod, 'get_signal_module', spy_get_signal_module)
+
+        spec = InstrumentSpec.build_simulation_default("XAUUSD")
+        spec.sanity_ok = True
+
+        with patch("shared.instrument_spec.get_spec", return_value=spec):
+            search = ParameterSearch(
+                symbol='XAUUSD',
+                template='hybrid_confluence',
+                df=df,
+                knowledge_base=temp_kb,
+                data_hash='h1_hash',
+                run_id='r_h1',
+                top_n=1,
+                timeframe='H1',
+            )
+            cands = search.run_optuna_search(df, candidate_id_prefix='hc_xau', n_trials=2)
+            assert len(cands) == 1
+            assert cands[0].timeframe == 'H1'
+
+            ft = FilterTesting(
+                symbol='XAUUSD',
+                df_opt=df,
+                df_held_out=df,
+                knowledge_base=temp_kb,
+                max_filters=1,
+            )
+            ft.test(cands[0], template='hybrid_confluence')
+
+        assert any(t == 'hybrid_confluence' and 'hybrid_confluence' in name for t, name in seen_modules)
+
+
+
+class TestWave46CombinationRouting:
+
+    def test_valid_combinations_reference_implemented_templates(self):
+        from trainer.core.adaptation import VALID_COMBINATIONS
+        from trainer.core.walk_forward import (
+            VALID_BASE_TEMPLATES,
+            ComboSignalAdapter,
+            get_signal_module,
+        )
+
+        exit_templates = [exit_t for _, exit_t, _ in VALID_COMBINATIONS]
+        assert 'bb_breakout' not in exit_templates
+        assert len(VALID_COMBINATIONS) >= 1
+
+        for entry_t, exit_t, _ in VALID_COMBINATIONS:
+            assert entry_t in VALID_BASE_TEMPLATES
+            assert exit_t in VALID_BASE_TEMPLATES
+            mod = get_signal_module(f"combo_{entry_t}__{exit_t}")
+            assert isinstance(mod, ComboSignalAdapter)
+
+    def test_combo_signal_adapter_routes_entry_and_exit_separately(self):
+        from trainer.core.walk_forward import get_signal_module, ComboSignalAdapter
+
+        adapter = get_signal_module('combo_ma_crossover__rsi_reversion')
+        assert isinstance(adapter, ComboSignalAdapter)
+
+        cache = {
+            'sma_fast': 1.1050,
+            'sma_fast_prev': 1.0990,
+            'sma_slow': 1.1000,
+            'sma_slow_prev': 1.1010,
+            'atr': 0.0020,
+            'adx': 25.0,
+            'close': 1.1050,
+            'rsi': 55.0,
+            'session': 'LONDON',
+            'pip_size': 0.0001,
+        }
+        params = {
+            'fast_ma_period': 5,
+            'slow_ma_period': 30,
+            'sl_atr_multiple': 1.5,
+            'tp_rr_ratio': 2.0,
+            'adx_threshold': 0,
+            'exit_on_midline': True,
+            'exit_on_opposite_crossover': False,
+        }
+
+        sig = adapter.generate_signal(cache, params)
+        assert sig['signal'] == 'BUY'
+        assert 'MA_CROSS_BULL' in sig['reason']
+
+        exit_res = adapter.check_exit(cache, {'direction': 'BUY'}, params)
+        assert exit_res['should_exit'] is True
+        assert exit_res['reason'] == 'EXIT_RSI_MIDLINE'
+
+    def test_combination_testing_merges_exit_defaults_and_uses_combo_module(self, monkeypatch):
+        import trainer.core.adaptation as adapt_mod
+        from trainer.core.adaptation import CombinationTesting, CandidateConfig
+        from trainer.core.walk_forward import ComboSignalAdapter
+        from shared.instrument_spec import InstrumentSpec
+        from unittest.mock import patch
+
+        dates = pd.date_range('2023-01-01', periods=20, freq='15min')
+        df = pd.DataFrame({
+            'open': np.linspace(1.1000, 1.1020, 20),
+            'high': np.linspace(1.1010, 1.1030, 20),
+            'low': np.linspace(1.0990, 1.1010, 20),
+            'close': np.linspace(1.1005, 1.1025, 20),
+            'volume': [100.0] * 20,
+        }, index=dates)
+
+        captured = {}
+
+        class DummyBacktester:
+            def __init__(self, symbol, params, initial_equity=10000.0, random_seed=42):
+                captured['params'] = dict(params)
+                self.initial_equity = initial_equity
+
+            def run(self, run_df, signal_module):
+                captured['signal_module'] = signal_module
+                return {
+                    'trades': [{'pnl': 50.0, 'net_pnl': 50.0, 'entry_time': dates[1], 'exit_time': dates[-1]} for _ in range(12)],
+                    'equity_curve': [10000.0 + i * 50.0 for i in range(20)],
+                }
+
+        monkeypatch.setattr(adapt_mod, 'Backtester', DummyBacktester)
+        monkeypatch.setattr(adapt_mod, 'calculate_metrics', lambda *a, **kw: {
+            'total_trades': 12, 'profit_factor': 2.5, 'sharpe_ratio': 1.8, 'max_drawdown_pct': 2.0,
+        })
+        monkeypatch.setattr(adapt_mod, 'calculate_quick_score', lambda m, min_trades=10: 0.90)
+
+        entry_cand = CandidateConfig(
+            candidate_id='ma_cand_1',
+            template='ma_crossover',
+            symbol='EURUSD',
+            timeframe='M15',
+            parameters={'fast_ma_period': 5, 'slow_ma_period': 30, 'sl_atr_multiple': 2.0, 'tp_rr_ratio': 2.5},
+            composite_score=0.50,
+        )
+        exit_cand = CandidateConfig(
+            candidate_id='rsi_cand_1',
+            template='rsi_reversion',
+            symbol='EURUSD',
+            timeframe='M15',
+            parameters={'rsi_period': 14, 'exit_on_midline': True, 'sl_atr_multiple': 1.0},
+            composite_score=0.45,
+        )
+
+        tester = CombinationTesting(symbol='EURUSD', df=df, improvement_threshold=0.05)
+        spec = InstrumentSpec.build_simulation_default('EURUSD')
+        with patch('shared.instrument_spec.get_spec', return_value=spec):
+            combo = tester._test_one_combination(entry_cand, exit_cand, 'ma_crossover', 'rsi_reversion')
+
+        assert combo is not None
+        assert combo.template == 'combo_ma_crossover__rsi_reversion'
+        assert isinstance(captured['signal_module'], ComboSignalAdapter)
+        # Entry parameter sl_atr_multiple=2.0 must NOT be overwritten by rsi_reversion space default (1.0)
+        assert captured['params']['sl_atr_multiple'] == 2.0
+        # Non-colliding rsi_reversion defaults must be merged in
+        assert captured['params']['exit_on_midline'] is True
+        assert captured['params']['rsi_period'] == 14

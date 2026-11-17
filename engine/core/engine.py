@@ -27,6 +27,10 @@ import os
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Tuple
+from zoneinfo import ZoneInfo
+
+PRAGUE_TZ = ZoneInfo("Europe/Prague")
+DEFAULT_MAGIC = 123456
 
 # MT5 import — graceful degradation if not available
 try:
@@ -177,7 +181,7 @@ def fetch_candles(symbol: str,
         return None
 
     rates = mt5.copy_rates_from_pos(
-        symbol, timeframe, 0, count
+        symbol, timeframe, 1, count
     )
     if rates is None or len(rates) == 0:
         log.warning(
@@ -209,20 +213,70 @@ def get_account_info() -> Dict:
         'profit':  info.profit,
     }
 
-def get_open_positions(symbol: str) -> list:
-    """Get open positions for symbol."""
+def _position_matches_magic(pos, magic: Optional[int]) -> bool:
+    """Return True if pos belongs to magic or has no integer magic attr (legacy mocks)."""
+    if magic is None:
+        return True
+    pos_magic = getattr(pos, 'magic', None)
+    if pos_magic is None or not isinstance(pos_magic, int) or isinstance(pos_magic, bool):
+        return True
+    return pos_magic == magic
+
+
+def resolve_mt5_timeframe(tf_str: str):
+    """Map strategy timeframe string ('M1'..'D1') to MT5 timeframe constant."""
+    if not MT5_AVAILABLE:
+        return None
+    mapping = {
+        'M1':  getattr(mt5, 'TIMEFRAME_M1', 1),
+        'M5':  getattr(mt5, 'TIMEFRAME_M5', 5),
+        'M15': getattr(mt5, 'TIMEFRAME_M15', 15),
+        'M30': getattr(mt5, 'TIMEFRAME_M30', 30),
+        'H1':  getattr(mt5, 'TIMEFRAME_H1', 16385),
+        'H4':  getattr(mt5, 'TIMEFRAME_H4', 16388),
+        'D1':  getattr(mt5, 'TIMEFRAME_D1', 16408),
+    }
+    key = tf_str.upper() if isinstance(tf_str, str) else 'M15'
+    return mapping.get(key, getattr(mt5, 'TIMEFRAME_M15', 15))
+
+
+def get_current_spread_pips(symbol: str) -> float:
+    """Query current live spread in pips via MT5 tick & InstrumentSpec (fallback 1.0)."""
+    if not MT5_AVAILABLE:
+        return 1.0
+    try:
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return 1.0
+        ask = getattr(tick, 'ask', None)
+        bid = getattr(tick, 'bid', None)
+        if not isinstance(ask, (int, float)) or not isinstance(bid, (int, float)):
+            return 1.0
+        from shared.instrument_spec import get_spec
+        spec = get_spec(symbol)
+        if spec is None or getattr(spec, 'pip_size', 0.0) <= 0:
+            return 1.0
+        spread_pips = float(ask - bid) / float(spec.pip_size)
+        return spread_pips if spread_pips > 0.0 else 1.0
+    except Exception:
+        return 1.0
+
+
+def get_open_positions(symbol: str, magic: Optional[int] = DEFAULT_MAGIC) -> list:
+    """Get open positions for symbol filtered by ATS magic number."""
     if not MT5_AVAILABLE:
         return []
     positions = mt5.positions_get(symbol=symbol)
     if positions is None:
         return []
-    return list(positions)
+    return [p for p in positions if _position_matches_magic(p, magic)]
 
 def calculate_lot_size(symbol: str,
                         sl_pips: float,
                         risk_pct: float,
                         balance: float,
-                        pip_size: float = None) -> float:
+                        pip_size: float = None,
+                        equity: Optional[float] = None) -> float:
     """
     Calculate position size using InstrumentSpec money math.
     Fails loudly with ValueError if InstrumentSpec is missing or sanity_ok is False.
@@ -242,7 +296,12 @@ def calculate_lot_size(symbol: str,
         raise ValueError(f"INSTRUMENT_SPEC_INVALID: InstrumentSpec for {symbol} is flagged sanity_ok=False.")
 
     sl_distance_price = sl_pips * spec.pip_size
-    lots = spec.lot_size_for_risk(account_balance=balance, risk_pct=risk_pct, sl_distance_price=sl_distance_price)
+    lots = spec.lot_size_for_risk(
+        account_balance=balance,
+        risk_pct=risk_pct,
+        sl_distance_price=sl_distance_price,
+        equity=equity,
+    )
     return lots
 
 def place_order(symbol: str,
@@ -495,9 +554,11 @@ class Engine:
         self.mandate_daily_start_equity: float = 0.0
 
         # Risk state variables (Fix 5.1 & Fix 5.3)
+        self.initial_equity: float = 0.0
         self.peak_equity: float = 0.0
         self.daily_start_equity: float = 0.0
         self.last_candle_time: Optional[datetime] = None
+        self.last_mandate_prague_date = None
         self.circuit_breaker_tripped: bool = False
         self.max_daily_loss_pct: float = 3.0
         self.max_trailing_dd_pct: float = 6.0
@@ -578,13 +639,22 @@ class Engine:
         if not clean_startup:
             log.warning("CRASH_DETECTED_RECOVERING: Unclean shutdown detected. Loading state snapshot...")
             snapshot = load_snapshot()
+            self.initial_equity = float(snapshot.get('initial_equity', 0.0))
             self.peak_equity = float(snapshot['peak_equity'])
             self.daily_start_equity = float(snapshot['daily_start_equity'])
+            self.mandate_daily_start_equity = float(
+                snapshot.get('mandate_daily_start_equity', self.daily_start_equity)
+            )
             self.circuit_breaker_tripped = bool(snapshot['circuit_breaker_tripped'])
             self.last_known_tickets = list(snapshot.get('last_known_tickets', []))
             
             last_candle_iso = snapshot['last_candle_time']
             self.last_candle_time = datetime.fromisoformat(last_candle_iso)
+            self.last_mandate_prague_date = (
+                self.last_candle_time.replace(tzinfo=timezone.utc)
+                if self.last_candle_time.tzinfo is None
+                else self.last_candle_time
+            ).astimezone(PRAGUE_TZ).date()
 
             # Check outage duration
             outage_duration = datetime.now(timezone.utc) - self.last_candle_time
@@ -620,6 +690,9 @@ class Engine:
             )
             return
 
+        if isinstance(getattr(spec, 'timeframe', None), str):
+            self.timeframe = resolve_mt5_timeframe(spec.timeframe)
+
         # Initialise components
         self.signal_engine = SignalEngine(spec)
         self.degradation   = DegradationMonitor(
@@ -640,15 +713,25 @@ class Engine:
         # Main loop
         self._main_loop()
 
+    def _get_own_open_positions(self) -> list:
+        """Query open positions for this symbol filtered strictly to this engine's magic."""
+        try:
+            positions = get_open_positions(self.symbol, magic=self.magic)
+        except TypeError:
+            positions = get_open_positions(self.symbol)
+        return [p for p in positions if _position_matches_magic(p, self.magic)]
+
     def save_snapshot(self) -> None:
         """Atomically persist state snapshot for crash recovery (Fix 5.1)."""
         snapshot = {
-            'peak_equity':            self.peak_equity,
-            'daily_start_equity':     self.daily_start_equity,
-            'circuit_breaker_tripped': self.circuit_breaker_tripped,
-            'last_known_tickets':     self.last_known_tickets,
-            'last_candle_time':       self.last_candle_time.isoformat() if self.last_candle_time else datetime.now(timezone.utc).isoformat(),
-            'updated_at':             datetime.now(timezone.utc).isoformat(),
+            'initial_equity':            self.initial_equity,
+            'peak_equity':               self.peak_equity,
+            'daily_start_equity':        self.daily_start_equity,
+            'mandate_daily_start_equity': self.mandate_daily_start_equity,
+            'circuit_breaker_tripped':   self.circuit_breaker_tripped,
+            'last_known_tickets':        self.last_known_tickets,
+            'last_candle_time':          self.last_candle_time.isoformat() if self.last_candle_time else datetime.now(timezone.utc).isoformat(),
+            'updated_at':                datetime.now(timezone.utc).isoformat(),
         }
         atomic_write_json(SNAPSHOT_FILE, snapshot)
 
@@ -719,7 +802,7 @@ class Engine:
         if not healthy:
             log.warning("Connection health check failed. Skipping candle fetch, signal generation, and new trade entries.")
             spec = self.strategy_loader.get_spec()
-            positions = get_open_positions(self.symbol)
+            positions = self._get_own_open_positions()
             if positions and spec:
                 account = get_account_info()
                 signal = {'signal': 'NONE', 'reason': 'Connection unhealthy — exit monitoring only'}
@@ -732,6 +815,8 @@ class Engine:
             new_spec = self.strategy_loader.get_spec()
             if new_spec:
                 self.signal_engine.update_spec(new_spec)
+                if isinstance(getattr(new_spec, 'timeframe', None), str):
+                    self.timeframe = resolve_mt5_timeframe(new_spec.timeframe)
                 self.degradation = DegradationMonitor(
                     strategy_id=new_spec.strategy_id,
                     wf_median_pf=new_spec.wf_median_profit_factor,
@@ -762,7 +847,10 @@ class Engine:
         equity  = account.get('equity', 10000.0)
         balance = account.get('balance', 10000.0)
 
-        # Initialise peak_equity and daily_start_equity on first candle if 0.0
+        # Initialise initial_equity, peak_equity and daily_start_equity on first candle if 0.0
+        if self.initial_equity == 0.0:
+            self.initial_equity = equity
+
         if self.peak_equity == 0.0 or equity > self.peak_equity:
             self.peak_equity = equity
 
@@ -772,7 +860,7 @@ class Engine:
         if self.mandate_daily_start_equity == 0.0:
             self.mandate_daily_start_equity = equity
 
-        # Check for UTC midnight date rollover
+        # Check for UTC midnight date rollover (legacy non-mandate daily circuit breaker)
         if self.last_candle_time is not None:
             if candle_dt.date() > self.last_candle_time.date():
                 log.info(
@@ -780,14 +868,33 @@ class Engine:
                     f"Resetting daily_start_equity from ${self.daily_start_equity:,.2f} to ${equity:,.2f}"
                 )
                 self.daily_start_equity = equity
-                self.mandate_daily_start_equity = equity
                 self.daily_halt_active = False
 
+        # Check for Europe/Prague midnight rollover (prop-firm mandate daily reset)
+        candle_prague_date = (
+            candle_dt.replace(tzinfo=timezone.utc)
+            if candle_dt.tzinfo is None
+            else candle_dt
+        ).astimezone(PRAGUE_TZ).date()
+
+        if self.last_mandate_prague_date is not None:
+            if candle_prague_date > self.last_mandate_prague_date:
+                log.info(
+                    f"PRAGUE DATE ROLLOVER ({self.last_mandate_prague_date} -> {candle_prague_date}): "
+                    f"Resetting mandate_daily_start_equity from ${self.mandate_daily_start_equity:,.2f} to ${equity:,.2f}"
+                )
+                self.mandate_daily_start_equity = equity
+
+        self.last_mandate_prague_date = candle_prague_date
         self.last_candle_time = candle_dt
 
-        # Circuit Breaker Evaluation (Fix 5.3 & WAVE 38)
+        # Circuit Breaker Evaluation (Fix 5.3 & WAVE 38 / Wave 45 static DD parity)
         daily_pnl_pct = ((equity - self.daily_start_equity) / self.daily_start_equity) * 100.0 if self.daily_start_equity > 0 else 0.0
-        trailing_dd_pct = ((self.peak_equity - equity) / self.peak_equity) * 100.0 if self.peak_equity > 0 else 0.0
+        if self.mandate and getattr(self.mandate, 'drawdown_type', 'static') == 'static':
+            dd_ref_equity = self.initial_equity if self.initial_equity > 0 else self.peak_equity
+        else:
+            dd_ref_equity = self.peak_equity
+        trailing_dd_pct = ((dd_ref_equity - equity) / dd_ref_equity) * 100.0 if dd_ref_equity > 0 else 0.0
 
         if daily_pnl_pct <= -self.max_daily_loss_pct:
             if not self.circuit_breaker_tripped:
@@ -799,8 +906,9 @@ class Engine:
 
         if trailing_dd_pct >= self.max_trailing_dd_pct:
             if not self.circuit_breaker_tripped:
+                dd_label = "Static" if (self.mandate and getattr(self.mandate, 'drawdown_type', 'static') == 'static') else "Trailing"
                 log.warning(
-                    f"TRAILING_DD_LIMIT_HIT: Trailing drawdown ({trailing_dd_pct:.2f}%) "
+                    f"TRAILING_DD_LIMIT_HIT: {dd_label} drawdown ({trailing_dd_pct:.2f}%) "
                     f"exceeds max threshold ({self.max_trailing_dd_pct}%). Circuit breaker TRIPPED."
                 )
             self.circuit_breaker_tripped = True
@@ -831,7 +939,11 @@ class Engine:
                     )
                 self.circuit_breaker_tripped = True
 
-            mandate_overall_dd = ((self.peak_equity - equity) / self.peak_equity) * 100.0 if self.peak_equity > 0 else 0.0
+            if getattr(self.mandate, 'drawdown_type', 'static') == 'static':
+                ref_equity = self.initial_equity if self.initial_equity > 0 else self.peak_equity
+            else:
+                ref_equity = self.peak_equity
+            mandate_overall_dd = ((ref_equity - equity) / ref_equity) * 100.0 if ref_equity > 0 else 0.0
             if mandate_overall_dd >= self.mandate.max_overall_drawdown_pct:
                 log.error(
                     f"MANDATE_OVERALL_DD_BREACH: Drawdown ({mandate_overall_dd:.2f}%) "
@@ -844,14 +956,16 @@ class Engine:
                         'overall_dd_pct': mandate_overall_dd,
                         'limit_pct': self.mandate.max_overall_drawdown_pct,
                         'drawdown_type': self.mandate.drawdown_type,
+                        'reference_equity': ref_equity,
+                        'initial_equity': self.initial_equity,
                         'peak_equity': self.peak_equity,
                         'current_equity': equity,
                     }
                 )
                 self.circuit_breaker_tripped = True
 
-                # Flatten all open positions immediately (Fix 6.3)
-                open_pos = get_open_positions(self.symbol)
+                # Flatten all open positions belonging to this engine immediately (Fix 6.3)
+                open_pos = self._get_own_open_positions()
                 if open_pos:
                     log.info(f"FLATTENING {len(open_pos)} OPEN POSITIONS DUE TO MANDATE DD BREACH.")
                     for pos in open_pos:
@@ -884,12 +998,12 @@ class Engine:
         )
 
         # 1. Position Management & Reconciliation (Closes run before Entries) (Fix 8.3)
-        positions = get_open_positions(self.symbol)
+        positions = self._get_own_open_positions()
         self._manage_positions(positions, signal,
                                 df, spec, account)
 
         # Re-query remaining positions post-management to reflect closes before entry evaluation (Fix 8.3)
-        remaining_positions = get_open_positions(self.symbol)
+        remaining_positions = self._get_own_open_positions()
 
         # Evaluate 9-Item Pre-Trade Checklist (Main PRD §3.2 & Panel 6)
         max_spread = (spec.filters.get('max_spread_pips', 3.0) if (spec and spec.filters) else 3.0)
@@ -897,7 +1011,14 @@ class Engine:
         regime_tgt = (getattr(spec, 'regime_target', None) if spec else None)
         mandate_d_loss = ((equity - self.mandate_daily_start_equity) / self.mandate_daily_start_equity) * 100.0 if (self.mandate and self.mandate_daily_start_equity > 0) else 0.0
         d_loss_ok = not (self.mandate and mandate_d_loss <= -self.mandate.max_daily_loss_pct)
-        mandate_ov_dd = ((self.peak_equity - equity) / self.peak_equity) * 100.0 if (self.mandate and self.peak_equity > 0) else 0.0
+        if self.mandate:
+            if getattr(self.mandate, 'drawdown_type', 'static') == 'static':
+                ov_ref = self.initial_equity if self.initial_equity > 0 else self.peak_equity
+            else:
+                ov_ref = self.peak_equity
+            mandate_ov_dd = ((ov_ref - equity) / ov_ref) * 100.0 if ov_ref > 0 else 0.0
+        else:
+            mandate_ov_dd = 0.0
         dd_ok = not (self.mandate and mandate_ov_dd >= self.mandate.max_overall_drawdown_pct)
         f_margin = float(getattr(account, 'margin_free', balance)) if account else float(balance)
 
@@ -919,7 +1040,7 @@ class Engine:
             mt5_connected=mt5_conn,
             strategy_spec=spec,
             data_fresh=data_is_fresh,
-            current_spread_pips=1.0,  # normalized live/backtest spread
+            current_spread_pips=get_current_spread_pips(self.symbol),
             max_spread_pips=max_spread,
             current_session=str(cache.get('session', 'UNKNOWN')),
             allowed_sessions=allowed_sess,
@@ -959,6 +1080,7 @@ class Engine:
                     {'symbol': self.symbol, 'signal': signal['signal'], 'reason': gate_reason}
                 )
             else:
+                self._last_candle_equity = equity
                 self._enter_trade(signal, spec, balance)
 
         # Write engine state for dashboard
@@ -1125,20 +1247,29 @@ class Engine:
 
     def _enter_trade(self, signal: Dict,
                       spec: StrategySpec,
-                      balance: float) -> None:
+                      balance: float,
+                      equity: Optional[float] = None) -> None:
         """Enter a new trade."""
         sl_pips = signal.get('sl_pips', 0)
         if sl_pips <= 0:
             log.error(f"ORDER_REJECTED_MISSING_SL_PIPS: Signal for {self.symbol} missing or invalid sl_pips ({sl_pips}).")
             return
 
+        sizing_equity = equity if equity is not None else getattr(self, '_last_candle_equity', None)
         lots = calculate_lot_size(
             symbol=self.symbol,
             sl_pips=sl_pips,
             risk_pct=spec.risk_per_trade_pct,
             balance=balance,
             pip_size=spec.pip_size,
+            equity=sizing_equity,
         )
+        if lots <= 0.0:
+            log.warning(
+                f"ORDER_ABORTED_ZERO_LOTS: Calculated lots={lots} <= 0 for {self.symbol} "
+                f"(sl_pips={sl_pips}, balance={balance}, equity={sizing_equity})."
+            )
+            return
 
         order = place_order(
             symbol=self.symbol,
@@ -1241,7 +1372,25 @@ class Engine:
             return
 
         for position in positions:
-            # Signal-based exit
+            # Strategy-level exit evaluation (e.g. combo_, rsi_reversion, donchian_breakout, hybrid_confluence)
+            if df is not None and self.signal_engine is not None and hasattr(self.signal_engine, 'check_exit'):
+                exit_res = self.signal_engine.check_exit(df, position)
+                if isinstance(exit_res, dict) and exit_res.get('should_exit'):
+                    reason_str = exit_res.get('reason') or 'SIGNAL_EXIT'
+                    log.info(
+                        f"Strategy exit signal ({reason_str}) — closing "
+                        f"position {position.ticket}"
+                    )
+                    closed = close_position(position, self.paper_mode)
+                    if closed:
+                        self._record_closed_trade(
+                            position,
+                            reason_str,
+                            account
+                        )
+                    continue
+
+            # Signal-based exit (opposite signal crossover)
             if spec.parameters.get(
                 'exit_on_opposite_crossover', False
             ):
@@ -1342,7 +1491,11 @@ class Engine:
                 ) if self.start_time else '',
                 candle_time      = now,
                 symbol           = self.symbol,
-                timeframe        = 'M15',
+                timeframe        = (
+                    spec.timeframe
+                    if isinstance(getattr(spec, 'timeframe', None), str)
+                    else 'M15'
+                ),
                 direction        = (
                     'BUY' if position.type == 0 else 'SELL'
                 ),
@@ -1404,7 +1557,7 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--symbol', default='EURUSD',
-        choices=['EURUSD', 'GBPUSD', 'USDJPY']
+        choices=['EURUSD', 'GBPUSD', 'USDJPY', 'USDCAD', 'XAUUSD']
     )
     parser.add_argument(
         '--paper', action='store_true',

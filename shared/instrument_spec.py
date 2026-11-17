@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import json
 import logging
+import math
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from typing import Optional, Dict
@@ -100,29 +101,40 @@ class InstrumentSpec:
     def lot_size_for_risk(self,
                            account_balance: float,
                            risk_pct: float,
-                           sl_distance_price: float) -> float:
+                           sl_distance_price: float,
+                           equity: Optional[float] = None) -> float:
         """
-        Calculate position size that risks exactly risk_pct of balance
-        for a given stop-loss distance in price terms.
+        Calculate position size that risks exactly risk_pct of sizing capital
+        (equity when provided, otherwise account_balance) for a given stop-loss
+        distance in price terms.
 
         Args:
             account_balance:   current account balance in account_currency
-            risk_pct:          e.g. 1.0 = 1% of balance
+            risk_pct:          e.g. 1.0 = 1% of sizing capital
             sl_distance_price: abs(entry_price - sl_price)
+            equity:            optional mark-to-market equity (preferred over balance)
 
         Returns:
-            lot size, rounded to volume_step, clamped to [min, max]
+            lot size, floored to volume_step, clamped to [min, max], or 0.0 on
+            invalid inputs or excessive minimum-lot risk.
         """
-        if sl_distance_price <= 0 or self.tick_value == 0:
-            return self.volume_min
+        sizing_capital = equity if equity is not None else account_balance
+        if sl_distance_price <= 0 or sizing_capital <= 0 or risk_pct <= 0:
+            return 0.0
+        if self.tick_size <= 0 or self.tick_value <= 0:
+            return 0.0
 
-        risk_amount      = account_balance * (risk_pct / 100)
-        sl_distance_ticks= sl_distance_price / self.tick_size
-        raw_lots         = risk_amount / (sl_distance_ticks * self.tick_value)
+        risk_amount       = sizing_capital * (risk_pct / 100.0)
+        sl_distance_ticks = sl_distance_price / self.tick_size
+        if sl_distance_ticks <= 0:
+            return 0.0
+        raw_lots          = risk_amount / (sl_distance_ticks * self.tick_value)
 
-        # Round down to volume_step
-        step     = self.volume_step
-        adj_lots = int(raw_lots / step) * step
+        # IEEE-754 safe floor to volume_step
+        step     = self.volume_step if self.volume_step > 0 else 0.01
+        adj_lots = math.floor((raw_lots + 1e-9) / step) * step
+        decimals = max(0, int(round(-math.log10(step)))) if step < 1 else 0
+        adj_lots = round(adj_lots, decimals)
 
         # Safety: if minimum lot would risk more than configured,
         # log and return 0 so the caller can skip the trade
@@ -139,9 +151,10 @@ class InstrumentSpec:
                     f"{risk_amount:.2f}. Returning 0 — skip trade."
                 )
                 return 0.0
+            return self.volume_min
 
-        adj_lots = max(self.volume_min, min(self.volume_max, adj_lots))
-        adj_lots = round(adj_lots, 2)
+        if self.volume_max > 0:
+            adj_lots = min(self.volume_max, adj_lots)
 
         return adj_lots
 

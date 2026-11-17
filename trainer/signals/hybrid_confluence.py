@@ -19,6 +19,7 @@ Exit logic:
 
 import pandas as pd
 from typing import Dict, Any
+from trainer.signals.ma_crossover import check_regime_and_session_filters, resolve_pip_size
 
 
 def generate_signal(cache: Dict[str, Any],
@@ -45,6 +46,11 @@ def generate_signal(cache: Dict[str, Any],
         if val is None or pd.isna(val):
             return _hold(f'NaN indicator: {name}')
 
+    filter_block = check_regime_and_session_filters(cache, params)
+    if filter_block:
+        return _hold(filter_block)
+
+    pip_size       = resolve_pip_size(cache, params)
     rsi_oversold   = params.get('rsi_oversold',   30)
     rsi_overbought = params.get('rsi_overbought', 70)
     adx_threshold  = params.get('adx_threshold',  20)
@@ -68,7 +74,7 @@ def generate_signal(cache: Dict[str, Any],
             ),
             'sl_price':   close - sl_dist,
             'tp_price':   close + tp_dist,
-            'sl_pips':    sl_dist / params.get('pip_size', 0.0001),
+            'sl_pips':    sl_dist / pip_size,
             'rr_ratio':   tp_rr,
             'confidence': 'HIGH',
         }
@@ -87,7 +93,7 @@ def generate_signal(cache: Dict[str, Any],
             ),
             'sl_price':   close + sl_dist,
             'tp_price':   close - tp_dist,
-            'sl_pips':    sl_dist / params.get('pip_size', 0.0001),
+            'sl_pips':    sl_dist / pip_size,
             'rr_ratio':   tp_rr,
             'confidence': 'HIGH',
         }

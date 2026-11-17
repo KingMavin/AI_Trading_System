@@ -4,13 +4,14 @@
   "account_id": "paper_100k",
   "max_daily_loss_pct": 4.0,
   "max_overall_drawdown_pct": 8.0,
-  "drawdown_type": "trailing",
+  "drawdown_type": "static",
   "min_trading_days": 5,
   "max_daily_risk_pct": 1.0,
   "symbol_universe": [
     "EURUSD",
     "GBPUSD",
-    "USDJPY"
+    "USDJPY",
+    "XAUUSD"
   ],
   "prohibited_patterns": []
 }

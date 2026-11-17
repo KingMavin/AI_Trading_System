@@ -49,11 +49,14 @@ class TestFullPipelineIntegration:
             return max(0.001, float(metrics.get('profit_factor', 0.1)))
         monkeypatch.setattr("trainer.core.walk_forward.composite_score", test_composite_score)
 
-    def test_full_pipeline_eurusd_real_data(self, tmp_path):
+    def test_full_pipeline_eurusd_real_data(self, tmp_path, monkeypatch):
         """
         13.2: Real EURUSD Full-Pipeline Integration Test.
         Runs TrainerRunner directly on a real 4-month EURUSD historical Parquet slice.
         """
+        import trainer.core.report as report_mod
+        monkeypatch.setattr(report_mod, 'DEFAULT_REPORT_DIR', tmp_path / 'reports')
+
         config = DEFAULT_CONFIG.copy()
         config['symbols'] = ['EURUSD']
         config['timeframe'] = 'M15'
@@ -78,6 +81,7 @@ class TestFullPipelineIntegration:
 
         runner = TrainerRunner(config=config, quick_mode=True)
         runner.kb_path = tmp_path / "test_kb.json"
+        runner.log_path = tmp_path / 'decision_log.jsonl'
         runner.mandate = test_mandate
 
         record = runner.run()
@@ -145,11 +149,15 @@ class TestFullPipelineIntegration:
         eur_spec = get_spec('EURUSD')
         assert eur_spec.pip_size == 0.0001
 
-    def test_full_pipeline_xauusd_real_data(self, tmp_path):
+    def test_full_pipeline_xauusd_real_data(self, tmp_path, monkeypatch):
         """
         13.3: Cross-Instrument Real-Data Integration Test (XAUUSD Gold).
-        Runs TrainerRunner directly on a real 4-month XAUUSD historical Parquet slice.
+        Runs the exact same pipeline but over XAUUSD H1.
+        Verifies: Tick value math, swap modelling, pip size differences.
         """
+        import trainer.core.report as report_mod
+        monkeypatch.setattr(report_mod, 'DEFAULT_REPORT_DIR', tmp_path / 'reports')
+
         config = DEFAULT_CONFIG.copy()
         config['symbols'] = ['XAUUSD']
         config['timeframe'] = 'M15'
@@ -174,6 +182,7 @@ class TestFullPipelineIntegration:
 
         runner = TrainerRunner(config=config, quick_mode=True)
         runner.kb_path = tmp_path / "test_xau_kb.json"
+        runner.log_path = tmp_path / 'decision_log.jsonl'
         runner.mandate = test_mandate
 
         record = runner.run()
@@ -200,17 +209,25 @@ class TestFullPipelineIntegration:
             assert dec['gate_results']['gate_9_mandate_compliant'] is True
 
         from trainer.core.mandate_evaluator import evaluate_backtest_mandate
-        sample_gold_equity = [10000.0, 10050.0, 9980.0, 10120.0]
+        sample_gold_equity = [
+            {'timestamp': '2026-01-01T10:00:00Z', 'equity': 10000.0},
+            {'timestamp': '2026-01-01T11:00:00Z', 'equity': 10050.0},
+            {'timestamp': '2026-01-01T12:00:00Z', 'equity': 9980.0},
+            {'timestamp': '2026-01-01T13:00:00Z', 'equity': 10120.0},
+        ]
         compliant, breach_reason = evaluate_backtest_mandate(sample_gold_equity, runner.mandate)
         assert compliant is True
         assert breach_reason is None
 
-    def test_full_pipeline_failure_path_mandate_breach(self, tmp_path):
+    def test_full_pipeline_failure_path_mandate_breach(self, tmp_path, monkeypatch):
         """
         13.4: Failure-Path Integration Test.
         Drives an artificial tight mandate limit (0.00001% max daily loss), confirming candidates
         trip Gate 9, receive candidate.gate_status = 'FAILED', and are rejected with breach reason preserved in decision log & report.
         """
+        import trainer.core.report as report_mod
+        monkeypatch.setattr(report_mod, 'DEFAULT_REPORT_DIR', tmp_path / 'reports')
+
         strict_mandate = Mandate(
             mandate_id="STRICT_TEST",
             firm_name="TestFirm",
@@ -235,6 +252,7 @@ class TestFullPipelineIntegration:
 
         runner = TrainerRunner(config=config, quick_mode=True)
         runner.kb_path = tmp_path / "test_fail_kb.json"
+        runner.log_path = tmp_path / 'decision_log.jsonl'
         runner.mandate = strict_mandate
 
         record = runner.run()

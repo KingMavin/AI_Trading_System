@@ -89,7 +89,9 @@ def run_backtest(symbol:  str = 'EURUSD',
     metrics = calculate_metrics(
         trades=result['trades'],
         equity_curve=result['equity_curve'],
-        initial_equity=initial_equity
+        initial_equity=initial_equity,
+        window_start=df.index[0] if not df.empty else None,
+        window_end=df.index[-1] if not df.empty else None
     )
     result['metrics'] = metrics
 
@@ -123,7 +125,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--symbol',
                         default='EURUSD',
-                        choices=['EURUSD', 'GBPUSD', 'USDJPY'])
+                        choices=['EURUSD', 'GBPUSD', 'USDJPY', 'USDCAD', 'XAUUSD'])
     parser.add_argument('--start',  default='2020-01-01')
     parser.add_argument('--end',    default='2023-12-31')
     parser.add_argument('--equity', default=10000.0, type=float)

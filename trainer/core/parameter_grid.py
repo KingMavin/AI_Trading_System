@@ -56,8 +56,8 @@ HYBRID_CONFLUENCE_SPACE = {
     'ma_type':         ['SMA'],              # 100% of top-decile was SMA
     # RSI pullback entry trigger
     'rsi_period':      [14],                 # only value historically tested
-    'rsi_oversold':    [25, 30, 35],         # bounce-from threshold for BUY
-    'rsi_overbought':  [65, 70, 75],         # bounce-from threshold for SELL
+    'rsi_oversold':    [30, 40, 45],         # bounce-from threshold for BUY
+    'rsi_overbought':  [55, 60, 70],         # bounce-from threshold for SELL
     # Trend strength confirmation
     'adx_threshold':   [0, 20, 25],          # 20/25 dominated top-decile; 0 = control arm
     # Risk parameters — narrow range to concentrate search on signal params

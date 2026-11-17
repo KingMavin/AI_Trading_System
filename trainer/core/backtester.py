@@ -99,19 +99,37 @@ class Backtester:
         self.equity_curve:  List[float]    = [initial_equity]
 
     def run(self, df: pd.DataFrame,
-            signal_module) -> Dict:
+            signal_module,
+            trade_start_time: Optional[datetime] = None) -> Dict:
         """
         Run backtest on DataFrame.
         Evaluates signals on candle close, executes fills on next candle open (zero look-ahead).
 
         Args:
-            df:            OHLCV DataFrame with DatetimeIndex
-            signal_module: module with generate_signal() and
-                           check_exit() functions
+            df:               OHLCV DataFrame with DatetimeIndex
+            signal_module:    module with generate_signal() and
+                              check_exit() functions
+            trade_start_time: optional timestamp gating earliest allowed active trading;
+                              bars before this time warm up indicators only
 
         Returns:
-            dict with trades, equity_curve, metrics
+            dict with trades, equity_curve, equity_timestamps, symbol, params
         """
+        if df.empty:
+            raise ValueError("Backtester.run() called with empty DataFrame \u2014 cannot initialise equity timestamps.")
+        initial_time = df.index[0]
+        self.equity_timestamps = [initial_time]
+
+        trade_start_ts = None
+        if trade_start_time is not None:
+            trade_start_ts = pd.Timestamp(trade_start_time)
+            if df.index.tz is not None and trade_start_ts.tzinfo is None:
+                trade_start_ts = trade_start_ts.tz_localize('UTC')
+            elif df.index.tz is not None and trade_start_ts.tzinfo is not None:
+                trade_start_ts = trade_start_ts.tz_convert(df.index.tz)
+            elif df.index.tz is None and trade_start_ts.tzinfo is not None:
+                trade_start_ts = trade_start_ts.tz_convert('UTC').tz_localize(None)
+
         # Pre-compute all indicators
         features = self._compute_features(df)
 
@@ -129,6 +147,7 @@ class Backtester:
         for i in range(warmup, len(features)):
             row     = features.iloc[i]
             row_prev= features.iloc[i - 1]
+            in_active_window = (trade_start_ts is None) or (row.name >= trade_start_ts)
 
             # Rollover check
             if current_date is None or dates[i] > current_date:
@@ -142,6 +161,9 @@ class Backtester:
                 daily_pnl_pct = ((current_equity - daily_start_equity) / daily_start_equity) * 100.0 if daily_start_equity > 0 else -100.0
                 if daily_pnl_pct <= -daily_loss_halt_pct:
                     self.daily_halt_active = True
+
+            # Update mark-to-market equity before entry/sizing checks
+            self.equity = self.balance + self._unrealised_pnl(row['open'])
 
             # Build indicator cache
             cache = self._build_cache(row, row_prev)
@@ -162,49 +184,50 @@ class Backtester:
 
             # Process pending entry signal from candle i-1 at candle i's open
             if pending_entry and self.open_position is None:
-                self._open_position(
-                    signal=pending_entry['signal'],
-                    base_price=row['open'],
-                    candle_time=row.name,
-                    cache=cache
-                )
+                if in_active_window:
+                    self._open_position(
+                        signal=pending_entry['signal'],
+                        base_price=row['open'],
+                        candle_time=row.name,
+                        cache=cache
+                    )
                 pending_entry = None
 
-            # Skip Dead Zone for new evaluations/checks. Note: pending entry/exit execution above
-            # is NOT gated by session because orders queued prior to Dead Zone execute at market open tick.
-            if cache['session'] == 'DEAD_ZONE':
-                continue
-
-            # Step 1: Check SL/TP on open position during candle i
+            # Step 1: Check SL/TP on open position during candle i (broker stops remain active in DEAD_ZONE)
             if self.open_position:
                 self._check_sl_tp(row, cache)
 
-            # Step 2: Check signal-based exit (evaluated at candle i close, queued for candle i+1 open)
-            if self.open_position and pending_exit is None:
-                exit_result = signal_module.check_exit(
-                    cache, self.open_position, self.params
-                )
-                if exit_result['should_exit']:
-                    pending_exit = {'reason': exit_result['reason']}
+            # Gate signal evaluation to outside DEAD_ZONE and inside the active window
+            if cache['session'] != 'DEAD_ZONE' and in_active_window:
+                # Step 2: Check signal-based exit (evaluated at candle i close, queued for candle i+1 open)
+                if self.open_position and pending_exit is None:
+                    exit_result = signal_module.check_exit(
+                        cache, self.open_position, self.params
+                    )
+                    if exit_result['should_exit']:
+                        pending_exit = {'reason': exit_result['reason']}
 
-            # Daily halt re-evaluation in case a position closed intracandle
-            if daily_loss_halt_pct > 0.0 and not self.daily_halt_active:
-                current_equity = self.balance + self._unrealised_pnl(row['close'])
-                daily_pnl = ((current_equity - daily_start_equity) / daily_start_equity) * 100.0 if daily_start_equity > 0 else -100.0
-                if daily_pnl <= -daily_loss_halt_pct:
-                    self.daily_halt_active = True
+                # Daily halt re-evaluation in case a position closed intracandle
+                if daily_loss_halt_pct > 0.0 and not self.daily_halt_active:
+                    current_equity = self.balance + self._unrealised_pnl(row['close'])
+                    daily_pnl = ((current_equity - daily_start_equity) / daily_start_equity) * 100.0 if daily_start_equity > 0 else -100.0
+                    if daily_pnl <= -daily_loss_halt_pct:
+                        self.daily_halt_active = True
 
-            # Step 3: Generate entry signal (evaluated at candle i close, queued for candle i+1 open)
-            if self.open_position is None and pending_entry is None and not self.daily_halt_active:
-                signal = signal_module.generate_signal(
-                    cache, self.params
-                )
-                if signal['signal'] in ('BUY', 'SELL'):
-                    pending_entry = {'signal': signal}
+                # Step 3: Generate entry signal (evaluated at candle i close, queued for candle i+1 open)
+                if self.open_position is None and pending_entry is None and not self.daily_halt_active:
+                    signal = signal_module.generate_signal(
+                        cache, self.params
+                    )
+                    if signal['signal'] in ('BUY', 'SELL'):
+                        pending_entry = {'signal': signal}
 
-            # Record equity
+            # Record mark-to-market equity on every candle (including DEAD_ZONE)
             unrealised = self._unrealised_pnl(cache['close'])
-            self.equity_curve.append(self.balance + unrealised)
+            self.equity = self.balance + unrealised
+            self.peak_equity = max(self.peak_equity, self.equity)
+            self.equity_curve.append(self.equity)
+            self.equity_timestamps.append(row.name)
 
         # Close any open position at end of data
         if self.open_position:
@@ -222,6 +245,7 @@ class Backtester:
         return {
             'trades':      self.closed_trades,
             'equity_curve':self.equity_curve,
+            'equity_timestamps': self.equity_timestamps,
             'symbol':      self.symbol,
             'params':      self.params,
         }
@@ -241,7 +265,8 @@ class Backtester:
             f['sma_fast'] = calculate_sma(df, fast)
             f['sma_slow'] = calculate_sma(df, slow)
 
-        f['rsi']        = calculate_rsi(df, 14)
+        rsi_period      = int(self.params.get('rsi_period', 14))
+        f['rsi']        = calculate_rsi(df, rsi_period)
         bb              = calculate_bbands(df, 20, 2.0)
         f['bb_pct']     = bb['bb_pct']
         f['atr']        = calculate_atr(df, 14)
@@ -296,6 +321,7 @@ class Backtester:
             'volume_rel':    self._clean_float(row.get('volume_rel'), 1.0),
             'session':       row['session'],
             'regime':        row['regime'],
+            'pip_size':      self.pip_size,
             'donchian_upper_entry': row.get('donchian_upper_entry'),
             'donchian_lower_entry': row.get('donchian_lower_entry'),
             'donchian_upper_exit':  row.get('donchian_upper_exit'),
@@ -319,17 +345,22 @@ class Backtester:
 
     def _simulated_slippage(self, cache: Dict) -> float:
         """Dynamic slippage based on volatility."""
-        base  = 0.3  # typical slippage in pips
+        base  = float(self.params.get('base_slippage_pips', 0.3))
         vol_m = _vol_mult(cache.get('atr_ratio', 1.0) or 1.0)
         noise = self.rng.uniform(0.85, 1.15)
         return base * vol_m * noise
 
     def _calculate_lot_size(self, sl_price: float,
                              entry_price: float) -> float:
-        """Calculate position size based on risk percentage."""
+        """Calculate position size based on risk percentage and current equity."""
         risk_pct = self.params.get('risk_per_trade_pct', 1.0)
         distance = abs(entry_price - sl_price)
-        return self.instrument_spec.lot_size_for_risk(self.balance, risk_pct, distance)
+        return self.instrument_spec.lot_size_for_risk(
+            account_balance=self.balance,
+            risk_pct=risk_pct,
+            sl_distance_price=distance,
+            equity=self.equity,
+        )
 
     def _open_position(self, signal: Dict,
                         base_price: float,
@@ -347,13 +378,33 @@ class Backtester:
         else:
             entry_price = base_price - (spread / 2) - slip
 
-        sl_price = signal['sl_price']
-        tp_price = signal['tp_price']
+        raw_sl = signal['sl_price']
+        raw_tp = signal['tp_price']
+        ref_price = signal.get('price')
+        if ref_price is not None and ref_price > 0 and self.params.get('reanchor_sl_on_fill', False):
+            sl_dist = abs(ref_price - raw_sl)
+            tp_dist = abs(raw_tp - ref_price)
+            sl_price = (entry_price - sl_dist) if direction == 'BUY' else (entry_price + sl_dist)
+            tp_price = (entry_price + tp_dist) if direction == 'BUY' else (entry_price - tp_dist)
+        else:
+            sl_price = raw_sl
+            tp_price = raw_tp
 
-        lots        = self._calculate_lot_size(sl_price, entry_price)
-        commission  = lots * 7.0 / 2  # Hardcoded $7/lot RT
+        # Guard against invalid SL side caused by extreme overnight gap beyond static SL
+        if (direction == 'BUY' and sl_price >= entry_price) or (
+            direction == 'SELL' and sl_price <= entry_price
+        ):
+            return
+
+        lots = self._calculate_lot_size(sl_price, entry_price)
+        if lots <= 0.0:
+            return
+
+        comm_per_lot = float(self.params.get('commission_per_lot', 7.0))
+        commission   = lots * comm_per_lot / 2.0
 
         self.balance -= commission
+        self.equity   = self.balance
 
         # Distance from fast MA specifically (sma_fast), in price ticks
         fast_ma = cache.get('sma_fast')
@@ -463,9 +514,25 @@ class Backtester:
         if pos is None:
             return
 
-        commission_close = pos['lots'] * 7.0 / 2  # Hardcoded $7/lot RT
-        
-        ticks_won = (price - pos['entry_price']) / self.instrument_spec.tick_size
+        exec_price = price
+        if self.params.get('apply_exit_costs', False) and reason not in ('TP_HIT', 'TP'):
+            slip_pips = self._simulated_slippage(cache)
+            slip = slip_pips * self.pip_size
+            if reason == 'SL_HIT':
+                exec_price = (price - slip) if pos['direction'] == 'BUY' else (price + slip)
+            else:
+                spread_pips = self._simulated_spread(cache)
+                spread = spread_pips * self.pip_size
+                exec_price = (
+                    (price - (spread / 2) - slip)
+                    if pos['direction'] == 'BUY'
+                    else (price + (spread / 2) + slip)
+                )
+
+        comm_per_lot = float(self.params.get('commission_per_lot', 7.0))
+        commission_close = pos['lots'] * comm_per_lot / 2.0
+
+        ticks_won = (exec_price - pos['entry_price']) / self.instrument_spec.tick_size
         if pos['direction'] == 'SELL':
             ticks_won = -ticks_won
         gross_pnl = ticks_won * pos['lots'] * self.instrument_spec.tick_value
@@ -487,7 +554,7 @@ class Backtester:
             'direction':         pos['direction'],
             'entry_price':       pos['entry_price'],
             'entry_time':        pos['entry_time'],
-            'exit_price':        price,
+            'exit_price':        exec_price,
             'exit_time':         candle_time,
             'lots':              pos['lots'],
             'gross_pnl':         round(gross_pnl, 2),

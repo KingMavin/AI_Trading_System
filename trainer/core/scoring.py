@@ -19,6 +19,7 @@ Production-worthy: >= 0.50
 """
 
 import sys
+import math
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
@@ -87,9 +88,12 @@ class CompositeScore:
     stability_contrib:  float   = 0.0
     robustness_contrib: float   = 0.0
 
-    # Modifier
+    # Modifier & penalties
     sensitivity_status: str     = 'MODERATE'
     sensitivity_mod:    float   = 0.0
+    trial_count:        int     = 1
+    deflation_penalty:  float   = 0.0
+    prop_firm_penalty:  float   = 0.0
 
     # Gate result
     gate_result:        Optional[GateResult] = None
@@ -343,6 +347,55 @@ def check_hard_gates(wf_summary: Dict,
             gate_details=details
         )
 
+    # Gate 9 (promotion-level): Enforce min_trading_days and max_daily_risk_pct across full OOS run
+    from engine.core.mandate import load_mandate
+    from trainer.core.mandate_evaluator import count_prague_trading_days
+    effective_mandate = mandate if mandate is not None else load_mandate()
+
+    configured_risk = wf_summary.get('risk_per_trade_pct')
+    if configured_risk is not None:
+        risk_val = float(configured_risk)
+        if risk_val > effective_mandate.max_daily_risk_pct:
+            return GateResult(
+                candidate_id=candidate_id,
+                passed=False,
+                failed_gate='gate_9_mandate_compliance',
+                failure_reason=(
+                    f"Mandate compliance breach: MANDATE_DAILY_RISK_BREACH: "
+                    f"Configured risk per trade {risk_val:.2f}% > limit {effective_mandate.max_daily_risk_pct:.2f}%"
+                ),
+                gate_details=details
+            )
+
+    for idx, tr in enumerate(all_oos_trades):
+        if isinstance(tr, dict) and tr.get('risk_pct') is not None:
+            tr_risk = float(tr['risk_pct'])
+            if tr_risk > effective_mandate.max_daily_risk_pct:
+                return GateResult(
+                    candidate_id=candidate_id,
+                    passed=False,
+                    failed_gate='gate_9_mandate_compliance',
+                    failure_reason=(
+                        f"Mandate compliance breach: MANDATE_DAILY_RISK_BREACH: "
+                        f"OOS trade {idx} risk {tr_risk:.2f}% > limit {effective_mandate.max_daily_risk_pct:.2f}%"
+                    ),
+                    gate_details=details
+                )
+
+    observed_trading_days = count_prague_trading_days(all_oos_trades)
+    details['gate_9_trading_days'] = observed_trading_days
+    if observed_trading_days < effective_mandate.min_trading_days:
+        return GateResult(
+            candidate_id=candidate_id,
+            passed=False,
+            failed_gate='gate_9_mandate_compliance',
+            failure_reason=(
+                f"Mandate compliance breach: MANDATE_MIN_TRADING_DAYS_BREACH: "
+                f"Observed {observed_trading_days} OOS trading days < required {effective_mandate.min_trading_days}"
+            ),
+            gate_details=details
+        )
+
     breach_rate, mc_reason = run_monte_carlo_stress_test(
         trades=all_oos_trades,
         symbol=symbol,
@@ -378,23 +431,32 @@ def check_hard_gates(wf_summary: Dict,
 def calculate_composite_score(wf_summary: Dict,
                                candidate_id: str = 'unknown',
                                tier2_robustness: float = None,
-                               sensitivity_status: str = 'MODERATE'
+                               sensitivity_status: str = 'MODERATE',
+                               *,
+                               trial_count: int,
+                               max_drawdown_limit_pct: float = 8.0
                                ) -> CompositeScore:
     """
     Calculate composite score for a candidate that passed
     all hard gates.
 
     Args:
-        wf_summary:          aggregated walk-forward metrics
-        candidate_id:        identifier for this candidate
-        tier2_robustness:    % of Tier 2 sources where PF > 1.0
-                             (None = no Tier 2 data available)
-        sensitivity_status:  ROBUST / MODERATE / FRAGILE
+        wf_summary:             aggregated walk-forward metrics
+        candidate_id:           identifier for this candidate
+        tier2_robustness:       % of Tier 2 sources where PF > 1.0
+                                (None = no Tier 2 data available)
+        sensitivity_status:     ROBUST / MODERATE / FRAGILE
+        trial_count:            required positive integer count of search trials
+                                evaluated (no default bypass permitted per AGENTS.md §4)
+        max_drawdown_limit_pct: overall static/mandate drawdown ceiling (%)
 
     Returns:
         CompositeScore with all dimension breakdowns
     """
-    result = CompositeScore(candidate_id=candidate_id)
+    if isinstance(trial_count, bool) or not isinstance(trial_count, int) or trial_count < 1:
+        raise ValueError(f"trial_count must be an integer >= 1, got {trial_count!r}")
+
+    result = CompositeScore(candidate_id=candidate_id, trial_count=trial_count)
 
     # ── Dimension 1: Calmar (40%) ──────────────────────
     calmar = wf_summary.get('median_calmar_ratio', 0.0)
@@ -471,28 +533,96 @@ def calculate_composite_score(wf_summary: Dict,
     else:
         result.sensitivity_mod = 0.0
 
+    # ── Multiple-testing & prop-firm penalties ─────────
+    deflation_penalty = round(min(0.20, 0.04 * math.log10(max(1, trial_count))), 4)
+    result.deflation_penalty = deflation_penalty
+
+    worst_dd_raw = wf_summary.get('worst_oos_drawdown_pct')
+    dd_limit = float(max_drawdown_limit_pct)
+    dd_warn_floor = 0.85 * dd_limit
+    if worst_dd_raw is not None and dd_limit > dd_warn_floor and float(worst_dd_raw) > dd_warn_floor:
+        dd_frac = min(1.0, (float(worst_dd_raw) - dd_warn_floor) / (dd_limit - dd_warn_floor))
+        prop_firm_penalty = round(0.10 * dd_frac, 4)
+    else:
+        prop_firm_penalty = 0.0
+    result.prop_firm_penalty = prop_firm_penalty
+
     # ── Final score ────────────────────────────────────
-    final = raw + result.sensitivity_mod
+    final = raw + result.sensitivity_mod - deflation_penalty - prop_firm_penalty
     result.composite = round(min(max(final, 0.0), 1.0), 4)
 
     return result
 
 
-def calculate_quick_score(metrics: Dict, min_trades: int = 10) -> float:
+def calculate_quick_score(
+    metrics: Dict,
+    min_trades: int = 10,
+    max_drawdown_limit_pct: float = 8.0,
+    allow_partial_trades: bool = False,
+) -> float:
     """
-    Calculate a fast, simplified score from a single backtest run.
-    Used for rapid candidate evaluation in adaptation stages.
+    Canonical single-run risk-adjusted composite score (0.0 to 1.0).
+
+    Combines Calmar ratio, Profit Factor, Sharpe ratio, Win Rate,
+    per-trade Expectancy (expectancy_pips or net_profit/total_trades),
+    and drawdown headroom against the static mandate DD limit (8.0% default).
     """
-    if metrics.get('total_trades', 0) < min_trades:
-        return 0.0
-    if metrics.get('profit_factor', 0.0) <= 1.0:
+    if metrics.get('mandate_compliant') is False:
         return 0.0
 
-    calmar = max(min(metrics.get('calmar_ratio', 0.0), 3.0), 0) / 3.0
-    pf     = max(min(metrics.get('profit_factor', 0.0), 3.0), 0) / 3.0
-    
-    # 50% Calmar, 50% Profit Factor for rapid adaptation filtering
-    return calmar * 0.50 + pf * 0.50
+    max_dd = float(metrics.get('max_drawdown_pct', 0.0) or 0.0)
+    if max_drawdown_limit_pct > 0 and max_dd > max_drawdown_limit_pct:
+        return 0.0
+
+    trades = int(metrics.get('total_trades', 0) or 0)
+    if trades <= 0:
+        return 0.0
+
+    if trades < min_trades:
+        if not allow_partial_trades:
+            return 0.0
+        trade_factor = (trades / float(max(1, min_trades))) ** 1.5
+    else:
+        trade_factor = 1.0
+
+    pf = float(metrics.get('profit_factor', 0.0) or 0.0)
+    if pf <= 1.0:
+        return 0.0
+
+    calmar = float(metrics.get('calmar_ratio', 0.0) or 0.0)
+    sharpe = float(metrics.get('sharpe_ratio', 0.0) or 0.0)
+    win_rate = float(metrics.get('win_rate', 0.0) or 0.0)
+    if win_rate > 1.0:
+        win_rate /= 100.0
+
+    calmar_norm = max(0.0, min(calmar, 3.0)) / 3.0
+    pf_norm = max(0.0, min((pf - 1.0) / 2.0, 1.0))
+    sharpe_norm = max(0.0, min(sharpe, 3.0)) / 3.0
+    wr_norm = max(0.0, min(win_rate, 1.0))
+
+    if 'expectancy_pips' in metrics and metrics['expectancy_pips'] is not None:
+        exp_val = float(metrics['expectancy_pips'])
+        exp_norm = max(0.0, min(exp_val / 20.0, 1.0))
+    else:
+        net_profit = float(metrics.get('net_profit', 0.0) or 0.0)
+        per_trade = net_profit / float(trades)
+        exp_norm = max(0.0, min(per_trade / 100.0, 1.0))
+
+    dd_limit = max_drawdown_limit_pct if max_drawdown_limit_pct > 0 else 8.0
+    dd_headroom = max(0.0, min(1.0 - (max_dd / dd_limit), 1.0))
+
+    raw = (
+        calmar_norm * 0.25
+        + pf_norm * 0.20
+        + sharpe_norm * 0.15
+        + wr_norm * 0.15
+        + exp_norm * 0.15
+        + dd_headroom * 0.10
+    )
+    return round(min(max(raw * trade_factor, 0.0), 1.0), 6)
+
+
+composite_score = calculate_quick_score
 
 
 # ── AGGREGATE WALK-FORWARD RESULTS ─────────────────────
@@ -611,6 +741,7 @@ def aggregate_wf_results(window_results: list) -> Dict:
         'median_calmar_ratio':       median(calmar_list),
         'median_avg_win_loss':       median(wl_list),
         'median_max_drawdown_pct':   median(dd_list),
+        'worst_oos_drawdown_pct':    max(dd_list) if dd_list else 0.0,
         'profitable_window_rate':    profitable_rate,
         'max_consecutive_losses':    max_consec,
         'regime_consistency':        regime_consistency,

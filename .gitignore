@@ -35,3 +35,13 @@ test_storage.py
 check_approvals.py
 fetch_mt5_data.py
 fetch_mt5_data_unified.py
+capture_specs.py
+*.bak
+
+# Documentation Archives, Scratch Markdown & Logs
+docs/archive/
+docs/changelogs/
+CHANGELOG_*.md
+*manual_verification*.md
+wave*_changelog.md
+

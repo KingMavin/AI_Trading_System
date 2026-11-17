@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 import pandas as pd
 from typing import Dict, Any
+from trainer.signals.ma_crossover import check_regime_and_session_filters, resolve_pip_size
 
 
 def generate_signal(cache: Dict[str, Any],
@@ -40,6 +41,12 @@ def generate_signal(cache: Dict[str, Any],
                        ('close', close)]:
         if val is None or pd.isna(val):
             return _hold(f"NaN indicator: {name}")
+
+    filter_block = check_regime_and_session_filters(cache, params)
+    if filter_block:
+        return _hold(filter_block)
+
+    pip_size = resolve_pip_size(cache, params)
 
     # Optional ADX filter
     adx_threshold = params.get('adx_threshold', params.get('adx_min_threshold', 0))
@@ -89,7 +96,7 @@ def generate_signal(cache: Dict[str, Any],
                           f"-> rsi={rsi:.2f} >= {rsi_oversold}"),
             'sl_price':  sl_price,
             'tp_price':  tp_price,
-            'sl_pips':   sl_distance / params.get('pip_size', 0.0001),
+            'sl_pips':   sl_distance / pip_size,
             'rr_ratio':  rr_ratio,
             'confidence':'HIGH' if adx_threshold == 0 else 'MEDIUM',
         }
@@ -107,7 +114,7 @@ def generate_signal(cache: Dict[str, Any],
                           f"-> rsi={rsi:.2f} <= {rsi_overbought}"),
             'sl_price':  sl_price,
             'tp_price':  tp_price,
-            'sl_pips':   sl_distance / params.get('pip_size', 0.0001),
+            'sl_pips':   sl_distance / pip_size,
             'rr_ratio':  rr_ratio,
             'confidence':'HIGH' if adx_threshold == 0 else 'MEDIUM',
         }

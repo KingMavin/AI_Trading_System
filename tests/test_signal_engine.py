@@ -232,3 +232,96 @@ class TestSignalEngine:
                 ratio   = tp_dist / sl_dist
                 assert ratio == pytest.approx(2.0, abs=0.05)
                 break
+
+    @pytest.mark.parametrize("tmpl", ['hybrid_confluence', 'rsi_reversion', 'donchian_breakout'])
+    def test_signal_engine_blocks_dead_zone_and_session_all_templates(self, eurusd_df, tmpl):
+        """DEAD_ZONE and allowed_sessions filters must gate delegated templates uniformly."""
+        spec = make_spec()
+        spec.template = tmpl
+        spec.filters = {'allowed_sessions': ['LONDON']}
+        engine = SignalEngine(spec)
+        cache = engine._compute_indicators(eurusd_df)
+        assert cache['pip_size'] == spec.pip_size
+
+        dead_cache = dict(cache, session='DEAD_ZONE')
+        res_dead = engine._generate_signal(dead_cache)
+        assert res_dead['signal'] == 'HOLD'
+        assert 'Dead zone' in res_dead['reason']
+
+        asian_cache = dict(cache, session='ASIAN')
+        res_sess = engine._generate_signal(asian_cache)
+        assert res_sess['signal'] == 'HOLD'
+        assert 'not in allowed list' in res_sess['reason']
+
+
+class TestWave46SignalEngineAndLoaderComboSupport:
+
+    def test_signal_engine_combo_entry_and_exit_routing(self, eurusd_df):
+        spec = make_spec()
+        spec.template = 'combo_ma_crossover__rsi_reversion'
+        spec.parameters['exit_on_midline'] = True
+        spec.parameters['rsi_period'] = 14
+        engine = SignalEngine(spec)
+
+        cache = engine._compute_indicators(eurusd_df)
+        cache['session'] = 'LONDON'
+        cache['sma_fast'] = 1.1050
+        cache['sma_fast_prev'] = 1.0990
+        cache['sma_slow'] = 1.1000
+        cache['sma_slow_prev'] = 1.1010
+        cache['rsi'] = 58.0
+        engine.indicator_cache = cache
+
+        sig = engine._generate_signal(cache)
+        assert sig['signal'] == 'BUY'
+        assert 'MA_CROSS_BULL' in sig['reason']
+
+        pos = type('Pos', (), {'ticket': 1, 'type': 0, 'price_open': 1.1050})()
+        exit_res = engine.check_exit(eurusd_df, pos)
+        assert exit_res['should_exit'] is True
+        assert exit_res['reason'] == 'EXIT_RSI_MIDLINE'
+
+    def test_strategy_loader_accepts_valid_combo_and_rejects_invalid(self, tmp_path):
+        import json
+        from engine.core.strategy_loader import StrategyLoader
+        from shared.dna import compute_dna_hash
+
+        params = {'fast_ma_period': 5, 'slow_ma_period': 30, 'exit_on_midline': True}
+        filters = {'allowed_sessions': ['LONDON']}
+        dna = compute_dna_hash(params, filters)
+
+        valid_file = tmp_path / 'valid_combo.json'
+        valid_file.write_text(json.dumps({
+            'strategy_id': 'COMBO-1',
+            'template': 'combo_ma_crossover__rsi_reversion',
+            'symbol': 'EURUSD',
+            'timeframe': 'M15',
+            'composite_score': 0.72,
+            'dna_hash': dna,
+            'parameters': params,
+            'filters': filters,
+            'wf_summary': {'median_win_rate': 0.55, 'median_profit_factor': 1.6},
+        }), encoding='utf-8')
+
+        loader = StrategyLoader(strategy_path=valid_file)
+        spec = loader.load_strategy()
+        assert spec is not None
+        assert spec.template == 'combo_ma_crossover__rsi_reversion'
+        assert loader.load_errors == 0
+
+        invalid_file = tmp_path / 'invalid_combo.json'
+        invalid_file.write_text(json.dumps({
+            'strategy_id': 'COMBO-BAD',
+            'template': 'combo_ma_crossover__bb_breakout',
+            'symbol': 'EURUSD',
+            'timeframe': 'M15',
+            'composite_score': 0.72,
+            'dna_hash': dna,
+            'parameters': params,
+            'filters': filters,
+            'wf_summary': {'median_win_rate': 0.55, 'median_profit_factor': 1.6},
+        }), encoding='utf-8')
+
+        bad_loader = StrategyLoader(strategy_path=invalid_file)
+        assert bad_loader.load_strategy() is None
+        assert bad_loader.load_errors == 1

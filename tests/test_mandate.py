@@ -477,3 +477,154 @@ class TestAuditLedger:
         assert r1['details']['detail'] == 'first'
         assert r2['event_type'] == 'EVENT_TWO'
         assert r2['details']['detail'] == 'second'
+
+
+# ── WAVE 45: ENGINE PARITY TESTS ────────────────────────
+
+class TestWave45EngineParity:
+
+    def _build_engine_for_candle_test(self, tmp_path, monkeypatch, drawdown_type='static'):
+        from engine.core.mandate import Mandate
+        mandate = Mandate(
+            mandate_id='WAVE45-MANDATE',
+            firm_name='FTMO_TEST',
+            account_id='ACC-001',
+            max_daily_loss_pct=4.0,
+            max_overall_drawdown_pct=8.0,
+            drawdown_type=drawdown_type,
+            min_trading_days=5,
+            max_daily_risk_pct=1.0,
+            symbol_universe=['EURUSD', 'XAUUSD'],
+        )
+        audit_log = tmp_path / 'audit_ledger.jsonl'
+        kill_file = tmp_path / 'KILL_SWITCH'
+        snapshot_file = tmp_path / 'engine_snapshot.json'
+
+        monkeypatch.setattr(mandate_mod, 'AUDIT_LOG_FILE', audit_log)
+        monkeypatch.setattr(engine_mod, 'KILL_SWITCH_FILE', kill_file)
+        monkeypatch.setattr(engine_mod, 'SNAPSHOT_FILE', snapshot_file)
+        monkeypatch.setattr(engine_mod, 'write_state', lambda *a, **kw: None)
+
+        engine = engine_mod.Engine(symbol='EURUSD', paper_mode=True, magic=123456)
+        engine.mandate = mandate
+        engine.running = True
+
+        mock_loader = MagicMock()
+        mock_spec = MagicMock()
+        mock_spec.strategy_id = 'ATS-W45'
+        mock_spec.template = 'ma_crossover'
+        mock_spec.timeframe = 'M15'
+        mock_spec.risk_per_trade_pct = 1.0
+        mock_spec.parameters = {}
+        mock_spec.filters = {}
+        mock_loader.get_spec.return_value = mock_spec
+        mock_loader.reload_if_changed.return_value = False
+        engine.strategy_loader = mock_loader
+
+        mock_signal_engine = MagicMock()
+        mock_signal_engine.process_candle.return_value = {'signal': 'HOLD', 'reason': 'No signal'}
+        mock_signal_engine.get_cache.return_value = {'session': 'LONDON', 'regime': 'TRENDING', 'close': 1.1000}
+        engine.signal_engine = mock_signal_engine
+        mock_degradation = MagicMock()
+        mock_degradation.get_summary.return_value = {'status': 'OK'}
+        engine.degradation = mock_degradation
+        engine.live_logger = MagicMock()
+        return engine
+
+    def test_foreign_magic_positions_are_ignored(self, monkeypatch):
+        from types import SimpleNamespace
+
+        own_pos = SimpleNamespace(ticket=101, magic=123456, type=0, volume=0.1, profit=5.0)
+        manual_pos = SimpleNamespace(ticket=102, magic=0, type=0, volume=0.5, profit=-200.0)
+        other_ea_pos = SimpleNamespace(ticket=103, magic=999888, type=1, volume=0.2, profit=15.0)
+
+        monkeypatch.setattr(
+            engine_mod,
+            'get_open_positions',
+            lambda sym, magic=None: [
+                p for p in [own_pos, manual_pos, other_ea_pos]
+                if engine_mod._position_matches_magic(p, magic)
+            ],
+        )
+
+        engine = engine_mod.Engine(symbol='EURUSD', paper_mode=True, magic=123456)
+        own = engine._get_own_open_positions()
+        assert [p.ticket for p in own] == [101]
+
+        # Even if an external mock returns unfiltered positions from get_open_positions,
+        # _get_own_open_positions still excludes foreign magic positions.
+        monkeypatch.setattr(engine_mod, 'get_open_positions', lambda sym: [own_pos, manual_pos, other_ea_pos])
+        own_strict = engine._get_own_open_positions()
+        assert [p.ticket for p in own_strict] == [101]
+
+    def test_static_drawdown_measured_from_initial_equity_not_peak(self, tmp_path, monkeypatch):
+        engine = self._build_engine_for_candle_test(tmp_path, monkeypatch, drawdown_type='static')
+        monkeypatch.setattr(engine_mod, 'get_open_positions', lambda sym, magic=None: [])
+
+        base = pd.DataFrame({'open': [1.1]*5, 'high': [1.101]*5, 'low': [1.099]*5, 'close': [1.1]*5, 'volume': [10.0]*5})
+
+        # Candle 1: initial_equity = 10000, peak_equity = 10000
+        df1 = base.copy()
+        df1.index = pd.date_range('2026-01-15 10:00', periods=5, freq='15min', tz='UTC')
+        monkeypatch.setattr(engine_mod, 'fetch_candles', lambda sym, tf, count: df1)
+        monkeypatch.setattr(engine_mod, 'get_account_info', lambda: {'equity': 10000.0, 'balance': 10000.0})
+        engine._process_candle()
+        assert engine.initial_equity == 10000.0
+        assert engine.circuit_breaker_tripped is False
+
+        # Candle 2: equity grows to 12000 (peak_equity = 12000, initial_equity stays 10000)
+        df2 = base.copy()
+        df2.index = pd.date_range('2026-01-15 10:15', periods=5, freq='15min', tz='UTC')
+        monkeypatch.setattr(engine_mod, 'fetch_candles', lambda sym, tf, count: df2)
+        monkeypatch.setattr(engine_mod, 'get_account_info', lambda: {'equity': 12000.0, 'balance': 12000.0})
+        engine._process_candle()
+        assert engine.peak_equity == 12000.0
+        assert engine.initial_equity == 10000.0
+
+        # Candle 3 (next Prague day so daily loss doesn't interfere): equity pulls back to 11000.
+        # Trailing DD from 12000 peak is 8.33% (>= 8.0%), but static DD from 10000 initial is 0.0%.
+        df3 = base.copy()
+        df3.index = pd.date_range('2026-01-16 10:00', periods=5, freq='15min', tz='UTC')
+        monkeypatch.setattr(engine_mod, 'fetch_candles', lambda sym, tf, count: df3)
+        monkeypatch.setattr(engine_mod, 'get_account_info', lambda: {'equity': 11000.0, 'balance': 11000.0})
+        engine._process_candle()
+        assert engine.circuit_breaker_tripped is False
+
+        # Candle 4 (next Prague day): equity falls to 9190 -> 8.1% static DD from 10000 initial -> BREACH!
+        df4 = base.copy()
+        df4.index = pd.date_range('2026-01-17 10:00', periods=5, freq='15min', tz='UTC')
+        monkeypatch.setattr(engine_mod, 'fetch_candles', lambda sym, tf, count: df4)
+        monkeypatch.setattr(engine_mod, 'get_account_info', lambda: {'equity': 9190.0, 'balance': 9190.0})
+        engine._process_candle()
+        assert engine.circuit_breaker_tripped is True
+
+    def test_mandate_daily_start_equity_rolls_over_at_prague_midnight(self, tmp_path, monkeypatch):
+        engine = self._build_engine_for_candle_test(tmp_path, monkeypatch, drawdown_type='static')
+        monkeypatch.setattr(engine_mod, 'get_open_positions', lambda sym, magic=None: [])
+
+        base = pd.DataFrame({'open': [1.1]*5, 'high': [1.101]*5, 'low': [1.099]*5, 'close': [1.1]*5, 'volume': [10.0]*5})
+
+        # 2026-01-15 22:45 UTC = 2026-01-15 23:45 Europe/Prague (winter CET = UTC+1)
+        df1 = base.copy()
+        df1.index = pd.date_range('2026-01-15 21:45', periods=5, freq='15min', tz='UTC')
+        monkeypatch.setattr(engine_mod, 'fetch_candles', lambda sym, tf, count: df1)
+        monkeypatch.setattr(engine_mod, 'get_account_info', lambda: {'equity': 10000.0, 'balance': 10000.0})
+        engine._process_candle()
+        assert engine.mandate_daily_start_equity == 10000.0
+
+        # 2026-01-15 23:00 UTC = 2026-01-16 00:00 Europe/Prague (SAME UTC date, NEW Prague date) -> MUST reset
+        df2 = base.copy()
+        df2.index = pd.date_range('2026-01-15 22:00', periods=5, freq='15min', tz='UTC')
+        monkeypatch.setattr(engine_mod, 'fetch_candles', lambda sym, tf, count: df2)
+        monkeypatch.setattr(engine_mod, 'get_account_info', lambda: {'equity': 10250.0, 'balance': 10250.0})
+        engine._process_candle()
+        assert engine.mandate_daily_start_equity == 10250.0
+
+        # 2026-01-16 00:00 UTC = 2026-01-16 01:00 Europe/Prague (NEW UTC date, SAME Prague date) -> MUST NOT overwrite
+        df3 = base.copy()
+        df3.index = pd.date_range('2026-01-15 23:00', periods=5, freq='15min', tz='UTC')
+        monkeypatch.setattr(engine_mod, 'fetch_candles', lambda sym, tf, count: df3)
+        monkeypatch.setattr(engine_mod, 'get_account_info', lambda: {'equity': 10400.0, 'balance': 10400.0})
+        engine._process_candle()
+        assert engine.mandate_daily_start_equity == 10250.0
+        assert engine.daily_start_equity == 10400.0

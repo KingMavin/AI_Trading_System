@@ -155,3 +155,34 @@ def test_deprioritize_never_exclude():
     # Check trials landing on fast_ma_period == 20 (which is outside the enqueued fast_ma_period set of [5, 10, 15])
     unexplored_fast = [p['fast_ma_period'] for p in sampled_params if p['fast_ma_period'] == 20]
     assert len(unexplored_fast) >= 1, "TPESampler failed to explore parameters outside enqueued set"
+
+
+def test_search_trial_timeframe_stored_and_filtered(tmp_path):
+    """Verify record_search_trial stores timeframe and get_top_historical_candidates filters by it."""
+    import json
+
+    kb_file = tmp_path / "knowledge_base.json"
+    kb = KnowledgeBase(base_path=str(kb_file))
+
+    h1_params = {'fast_ma_period': 10, 'slow_ma_period': 50, 'sl_atr_multiple': 2.0, 'tp_rr_ratio': 2.5, 'adx_threshold': 20}
+    m15_params = {'fast_ma_period': 5, 'slow_ma_period': 20, 'sl_atr_multiple': 1.0, 'tp_rr_ratio': 1.5, 'adx_threshold': 0}
+
+    kb.record_search_trial(
+        template="ma_crossover", symbol="XAUUSD", run_id="r1", data_hash="h1",
+        trial_number=0, params=h1_params, is_coherent=True, composite_score=0.72, timeframe="H1",
+    )
+    kb.record_search_trial(
+        template="ma_crossover", symbol="XAUUSD", run_id="r2", data_hash="h2",
+        trial_number=1, params=m15_params, is_coherent=True, composite_score=0.68, timeframe="M15",
+    )
+
+    lines = [json.loads(line) for line in kb.search_history_path.read_text().splitlines() if line.strip()]
+    assert [r['timeframe'] for r in lines] == ['H1', 'M15']
+
+    top_h1 = kb.get_top_historical_candidates("ma_crossover", "XAUUSD", top_k=5, timeframe="H1")
+    assert len(top_h1) == 1
+    assert top_h1[0]['fast_ma_period'] == 10
+
+    top_m15 = kb.get_top_historical_candidates("ma_crossover", "XAUUSD", top_k=5, timeframe="M15")
+    assert len(top_m15) == 1
+    assert top_m15[0]['fast_ma_period'] == 5

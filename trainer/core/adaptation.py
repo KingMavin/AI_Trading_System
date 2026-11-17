@@ -32,14 +32,13 @@ import logging
 
 from trainer.core.parameter_grid import get_grid, TEMPLATE_SPACES
 from trainer.core.backtester import Backtester
-from trainer.core.walk_forward import WalkForwardValidator
+from trainer.core.walk_forward import WalkForwardValidator, get_signal_module
 from trainer.core.scoring import (
     check_hard_gates, calculate_composite_score,
     aggregate_wf_results, calculate_quick_score
 )
 from trainer.core.knowledge_base import KnowledgeBase
 from shared.metrics import calculate_metrics
-import trainer.signals.ma_crossover as ma_crossover
 
 import os
 
@@ -142,7 +141,8 @@ class ParameterSearch:
                  data_hash:     str,
                  run_id:        str,
                  initial_equity:float = 10000.0,
-                 top_n:         int   = 5):
+                 top_n:         int   = 5,
+                 timeframe:     str   = 'M15'):
 
         self.symbol         = symbol
         self.template       = template
@@ -152,6 +152,7 @@ class ParameterSearch:
         self.run_id         = run_id
         self.initial_equity = initial_equity
         self.top_n          = top_n
+        self.timeframe      = timeframe
         self.evaluations    = 0
 
     def _score_params(self, params: Dict,
@@ -163,7 +164,7 @@ class ParameterSearch:
         gate    = check_hard_gates(summary, 'scoring')
         if not gate.passed:
             return 0.0
-        score = calculate_composite_score(summary, 'scoring')
+        score = calculate_composite_score(summary, 'scoring', trial_count=1)
         return score.composite
 
     def _run_quick_backtest(self, params: Dict,
@@ -180,11 +181,14 @@ class ParameterSearch:
                 initial_equity=self.initial_equity,
                 random_seed=seed
             )
-            result  = bt.run(df_slice, ma_crossover)
+            signal_mod = get_signal_module(self.template)
+            result  = bt.run(df_slice, signal_mod)
             metrics = calculate_metrics(
                 trades=result['trades'],
                 equity_curve=result['equity_curve'],
-                initial_equity=self.initial_equity
+                initial_equity=self.initial_equity,
+                window_start=df_slice.index[0] if not df_slice.empty else None,
+                window_end=df_slice.index[-1] if not df_slice.empty else None
             )
             self.evaluations += 1
 
@@ -223,7 +227,7 @@ class ParameterSearch:
                 candidate_id=f"{candidate_id_prefix}_{i}",
                 template=self.template,
                 symbol=self.symbol,
-                timeframe='M15',
+                timeframe=self.timeframe,
                 parameters=params,
             )
             config_hash = candidate.compute_hash()
@@ -290,7 +294,7 @@ class ParameterSearch:
                 ),
                 template=self.template,
                 symbol=self.symbol,
-                timeframe='M15',
+                timeframe=self.timeframe,
                 parameters=params,
                 source='parameter_search',
             )
@@ -365,7 +369,7 @@ class ParameterSearch:
 
             config_hash = CandidateConfig(
                 candidate_id="", template=self.template, symbol=self.symbol,
-                timeframe="M15", parameters=params
+                timeframe=self.timeframe, parameters=params
             ).compute_hash()
 
             if config_hash in visited_hashes:
@@ -392,7 +396,8 @@ class ParameterSearch:
                 params=params,
                 is_coherent=True,
                 composite_score=score,
-                in_sample_regime='UNKNOWN'
+                in_sample_regime='UNKNOWN',
+                timeframe=self.timeframe,
             )
 
             visited_hashes.add(config_hash)
@@ -404,7 +409,8 @@ class ParameterSearch:
 
         # Search Memory Warm-Start Enqueuing
         top_historical = self.kb.get_top_historical_candidates(
-            template=self.template, symbol=self.symbol, top_k=5
+            template=self.template, symbol=self.symbol, top_k=5,
+            timeframe=self.timeframe,
         )
         if top_historical:
             enqueued_count = 0
@@ -440,7 +446,7 @@ class ParameterSearch:
                 candidate_id=f"{candidate_id_prefix}_top{idx+1}",
                 template=self.template,
                 symbol=self.symbol,
-                timeframe='M15',
+                timeframe=self.timeframe,
                 parameters=params,
                 source='parameter_search',
             )
@@ -550,7 +556,7 @@ class FilterTesting:
         self.max_filters   = max_filters
         self.threshold     = improvement_threshold
 
-    def _quick_score(self, params: Dict, df) -> float:
+    def _quick_score(self, params: Dict, df, template: str = 'ma_crossover') -> float:
         """Run backtest and return simple score."""
         try:
             bt      = Backtester(
@@ -559,11 +565,14 @@ class FilterTesting:
                 initial_equity=self.initial_equity,
                 random_seed=99
             )
-            result  = bt.run(df, ma_crossover)
+            signal_mod = get_signal_module(template)
+            result  = bt.run(df, signal_mod)
             metrics = calculate_metrics(
                 result['trades'],
                 result['equity_curve'],
-                self.initial_equity
+                self.initial_equity,
+                window_start=df.index[0] if not df.empty else None,
+                window_end=df.index[-1] if not df.empty else None
             )
             return calculate_quick_score(metrics, min_trades=10)
         except Exception as e:
@@ -578,7 +587,7 @@ class FilterTesting:
         """
         base_params    = candidate.parameters.copy()
         base_score     = self._quick_score(
-            base_params, self.df_held_out
+            base_params, self.df_held_out, template=template
         )
         current_params = base_params.copy()
         current_score  = base_score
@@ -618,7 +627,7 @@ class FilterTesting:
                 test_params = current_params.copy()
                 test_params.update(setting)
                 score = self._quick_score(
-                    test_params, self.df_opt
+                    test_params, self.df_opt, template=template
                 )
                 if score > best_filter_score:
                     best_filter_score  = score
@@ -631,7 +640,7 @@ class FilterTesting:
             test_params = current_params.copy()
             test_params.update(best_filter_setting)
             held_out_score = self._quick_score(
-                test_params, self.df_held_out
+                test_params, self.df_held_out, template=template
             )
 
             improved = (
@@ -680,8 +689,9 @@ class FilterTesting:
 
 # Valid template combinations
 VALID_COMBINATIONS = [
-    ('ma_crossover', 'rsi_reversion',  'Trend entry + mean reversion exit'),
-    ('ma_crossover', 'bb_breakout',    'Trend entry + volatility exit'),
+    ('ma_crossover',      'rsi_reversion', 'Trend entry + RSI midline exit'),
+    ('donchian_breakout', 'rsi_reversion', 'Breakout entry + RSI midline exit'),
+    ('hybrid_confluence', 'rsi_reversion', 'Confluence entry + RSI midline exit'),
 ]
 
 class CombinationTesting:
@@ -695,11 +705,13 @@ class CombinationTesting:
                  symbol:        str,
                  df,
                  initial_equity:float = 10000.0,
-                 improvement_threshold: float = 0.05):
+                 improvement_threshold: float = 0.05,
+                 timeframe:     str   = 'M15'):
         self.symbol        = symbol
         self.df            = df
         self.initial_equity= initial_equity
         self.threshold     = improvement_threshold
+        self.timeframe     = timeframe
 
     def test(self,
              candidates_by_template: Dict[str, List[CandidateConfig]]
@@ -757,18 +769,16 @@ class CombinationTesting:
                                exit_tmpl:       str
                                ) -> Optional[CandidateConfig]:
         """
-        Test one entry+exit combination.
-        Returns CandidateConfig if it beats both parents,
-        None otherwise.
+        Test one entry+exit combination using ComboSignalAdapter routing
+        (entry signals from entry_tmpl, signal exits from exit_tmpl).
+        Returns CandidateConfig if it beats both parents, None otherwise.
         """
-        # For Phase 1: combinations use the same backtester
-        # but we note the intent. Full combination logic
-        # (routing exit signals from exit_tmpl) is Phase 2.
-        # Here we test whether the exit_candidate parameters
-        # on top of entry_candidate improve results.
-
         combined_params = entry_candidate.parameters.copy()
-        combined_params['exit_on_opposite_crossover'] = True
+        for k, values in TEMPLATE_SPACES.get(exit_tmpl, {}).items():
+            if k not in combined_params and values:
+                combined_params[k] = values[0]
+
+        combo_template = f"combo_{entry_tmpl}__{exit_tmpl}"
 
         try:
             bt = Backtester(
@@ -777,11 +787,14 @@ class CombinationTesting:
                 initial_equity=self.initial_equity,
                 random_seed=42
             )
-            result  = bt.run(self.df, ma_crossover)
+            signal_mod = get_signal_module(combo_template)
+            result  = bt.run(self.df, signal_mod)
             metrics = calculate_metrics(
                 result['trades'],
                 result['equity_curve'],
-                self.initial_equity
+                self.initial_equity,
+                window_start=self.df.index[0] if not self.df.empty else None,
+                window_end=self.df.index[-1] if not self.df.empty else None
             )
 
             combo_score = calculate_quick_score(metrics, min_trades=10)
@@ -802,12 +815,12 @@ class CombinationTesting:
 
             combo = CandidateConfig(
                 candidate_id=(
-                    f"combo_{entry_tmpl}_{exit_tmpl}_"
+                    f"{combo_template}_"
                     f"{entry_candidate.candidate_id}"
                 ),
-                template=f"combo_{entry_tmpl}_{exit_tmpl}",
+                template=combo_template,
                 symbol=self.symbol,
-                timeframe='M15',
+                timeframe=self.timeframe,
                 parameters=combined_params,
                 source='combination',
             )
@@ -867,7 +880,8 @@ class AdaptationSystem:
                  run_id:        str,
                  templates:     List[str] = None,
                  initial_equity:float     = 10000.0,
-                 top_n:         int       = 5):
+                 top_n:         int       = 5,
+                 timeframe:     str       = 'M15'):
 
         self.symbol         = symbol
         self.df             = df
@@ -878,6 +892,7 @@ class AdaptationSystem:
         self.templates      = templates or ['ma_crossover']
         self.initial_equity = initial_equity
         self.top_n          = top_n
+        self.timeframe      = timeframe
 
     def run(self) -> List[CandidateConfig]:
         """
@@ -916,6 +931,7 @@ class AdaptationSystem:
                 run_id=self.run_id,
                 initial_equity=self.initial_equity,
                 top_n=self.top_n,
+                timeframe=self.timeframe,
             )
 
             candidates = search.run_optuna_search(
@@ -974,6 +990,7 @@ class AdaptationSystem:
             symbol=self.symbol,
             df=self.df,
             initial_equity=self.initial_equity,
+            timeframe=self.timeframe,
         )
 
         combo_candidates = combo_tester.test(

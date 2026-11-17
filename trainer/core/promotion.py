@@ -207,7 +207,10 @@ class PromotionEngine:
     def decide(self,
                score:      CompositeScore,
                wf_summary: Dict,
-               gate_result:GateResult) -> PromotionDecision:
+               gate_result:GateResult,
+               template:   Optional[str] = None,
+               symbol:     Optional[str] = None,
+               timeframe:  Optional[str] = None) -> PromotionDecision:
         """
         Make a promotion decision for one candidate.
 
@@ -283,6 +286,14 @@ class PromotionEngine:
                 recommendation  = rec
             )
             self._record(decision, gate_result)
+            if outcome == 'PROMOTED' and self.deploy_path:
+                self._deploy(
+                    decision,
+                    wf_summary,
+                    template=template,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                )
             return decision
 
         # ── Doesn't beat baseline → Auto Reject ────────
@@ -328,7 +339,13 @@ class PromotionEngine:
             )
             self._record(decision, gate_result)
             if self.deploy_path:
-                self._deploy(decision, wf_summary)
+                self._deploy(
+                    decision,
+                    wf_summary,
+                    template=template,
+                    symbol=symbol,
+                    timeframe=timeframe,
+                )
             return decision
 
         # ── Flag for Review ────────────────────────────
@@ -362,10 +379,21 @@ class PromotionEngine:
         return decision
 
     def _deploy(self, decision: PromotionDecision,
-                wf_summary: Dict) -> None:
+                wf_summary: Dict,
+                template: Optional[str] = None,
+                symbol: Optional[str] = None,
+                timeframe: Optional[str] = None) -> None:
         """Write strategy file to deploy path."""
         if self.deploy_path is None:
             return
+
+        resolved_template = template or wf_summary.get('template')
+        resolved_symbol = symbol or wf_summary.get('symbol')
+        resolved_timeframe = timeframe or wf_summary.get('timeframe') or 'M15'
+        if not resolved_template:
+            raise ValueError("Cannot deploy strategy: 'template' must be explicitly specified.")
+        if not resolved_symbol:
+            raise ValueError("Cannot deploy strategy: 'symbol' must be explicitly specified.")
 
         self.deploy_path.mkdir(parents=True, exist_ok=True)
 
@@ -383,11 +411,15 @@ class PromotionEngine:
 
         # Write new strategy
         params = wf_summary.get('best_params', {})
-        filters = {}
+        filters = wf_summary.get('filters', {})
         dna_hash = compute_dna_hash(params, filters)
 
         strategy = {
+            'version':            '3.0',
             'strategy_id':        decision.candidate_id,
+            'template':           resolved_template,
+            'symbol':             resolved_symbol,
+            'timeframe':          resolved_timeframe,
             'dna_hash':           dna_hash,
             'composite_score':    decision.composite_score,
             'promoted_at':        datetime.now(
@@ -404,7 +436,7 @@ class PromotionEngine:
         # Atomic write
         tmp = active.with_suffix('.json.tmp')
         with open(tmp, 'w') as f:
-            json.dump(strategy, f, indent=2)
+            json.dump(strategy, f, indent=2, default=str)
         tmp.rename(active)
 
     def _record(self, decision: PromotionDecision,

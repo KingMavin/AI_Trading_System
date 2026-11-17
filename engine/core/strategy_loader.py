@@ -142,6 +142,20 @@ class StrategyLoader:
                 self.load_errors += 1
                 return None
 
+        # Validate template name (base template or combo_<entry>__<exit>)
+        template = data.get('template', 'ma_crossover')
+        from trainer.core.walk_forward import VALID_BASE_TEMPLATES, parse_combo_template
+        try:
+            parsed_combo = parse_combo_template(template)
+        except ValueError as exc:
+            log.error(f"Strategy file has invalid combo template '{template}': {exc}")
+            self.load_errors += 1
+            return None
+        if parsed_combo is None and template not in VALID_BASE_TEMPLATES:
+            log.error(f"Strategy file has unknown template: {template}")
+            self.load_errors += 1
+            return None
+
         # Extract parameters
         params = data.get('parameters', {})
         wf_summary = data.get('wf_summary', {})

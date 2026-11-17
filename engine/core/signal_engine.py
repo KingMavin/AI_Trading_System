@@ -91,9 +91,11 @@ class SignalEngine:
             if self.candles_processed < 2:
                 return self._no_signal('Warming up indicators')
 
-            # Add previous values for crossover detection
-            cache['sma_fast_prev'] = prev_cache.get('sma_fast')
-            cache['sma_slow_prev'] = prev_cache.get('sma_slow')
+            # Add previous values for crossover detection (preserve computed series[-2] when present)
+            if cache.get('sma_fast_prev') is None:
+                cache['sma_fast_prev'] = prev_cache.get('sma_fast')
+            if cache.get('sma_slow_prev') is None:
+                cache['sma_slow_prev'] = prev_cache.get('sma_slow')
 
             # Inject state (WAVE 38)
             if strategy_state is not None:
@@ -194,33 +196,52 @@ class SignalEngine:
             'session':      session,
             'regime':       regime,
             'candle_time':  df.index[-1],
+            'pip_size':     spec.pip_size,
         }
 
     def _generate_signal(self, cache: Dict) -> Dict:
         spec = self.spec
 
-        # Template delegation for templates
-        if spec.template == 'rsi_reversion':
+        # Dead zone — never trade (enforced uniformly across all templates)
+        if cache.get('session') == 'DEAD_ZONE':
+            return self._no_signal('Dead zone — no trading')
+
+        # Session filter (enforced uniformly across all templates)
+        allowed = spec.filters.get('allowed_sessions')
+        if allowed and cache.get('session') not in allowed:
+            return self._no_signal(
+                f"Session {cache.get('session')} "
+                f"not in allowed list"
+            )
+
+        # Template delegation for base and combo_<entry>__<exit> templates
+        from trainer.core.walk_forward import parse_combo_template, VALID_BASE_TEMPLATES
+        parsed_combo = parse_combo_template(spec.template)
+        entry_tmpl = parsed_combo[0] if parsed_combo is not None else spec.template
+
+        if entry_tmpl == 'rsi_reversion':
             import trainer.signals.rsi_reversion as rsi_reversion
             res = rsi_reversion.generate_signal(cache, spec.parameters)
             res['session'] = cache.get('session')
             res['regime'] = cache.get('regime')
             res['candle_time'] = str(cache.get('candle_time', ''))
             return res
-        elif spec.template == 'donchian_breakout':
+        elif entry_tmpl == 'donchian_breakout':
             import trainer.signals.donchian_breakout as donchian_breakout
             res = donchian_breakout.generate_signal(cache, spec.parameters)
             res['session'] = cache.get('session')
             res['regime'] = cache.get('regime')
             res['candle_time'] = str(cache.get('candle_time', ''))
             return res
-        elif spec.template == 'hybrid_confluence':
+        elif entry_tmpl == 'hybrid_confluence':
             import trainer.signals.hybrid_confluence as hybrid_confluence
             res = hybrid_confluence.generate_signal(cache, spec.parameters)
             res['session'] = cache.get('session')
             res['regime'] = cache.get('regime')
             res['candle_time'] = str(cache.get('candle_time', ''))
             return res
+        elif entry_tmpl != 'ma_crossover':
+            raise ValueError(f"Unknown strategy template: {spec.template!r}")
 
         # Validate required values
         required = ['sma_fast', 'sma_slow', 'atr', 'close']
@@ -229,10 +250,6 @@ class SignalEngine:
                 return self._no_signal(
                     f'NaN indicator: {key}'
                 )
-
-        # Dead zone — never trade
-        if cache['session'] == 'DEAD_ZONE':
-            return self._no_signal('Dead zone — no trading')
 
         # ADX filter
         adx_threshold = spec.parameters.get(
@@ -245,14 +262,6 @@ class SignalEngine:
                     f"ADX {adx:.1f} below "
                     f"threshold {adx_threshold}"
                 )
-
-        # Session filter
-        allowed = spec.filters.get('allowed_sessions')
-        if allowed and cache['session'] not in allowed:
-            return self._no_signal(
-                f"Session {cache['session']} "
-                f"not in allowed list"
-            )
 
         sma_fast      = cache['sma_fast']
         sma_fast_prev = cache.get('sma_fast_prev')
@@ -329,3 +338,37 @@ class SignalEngine:
     def get_cache(self) -> Dict:
         """Return current indicator cache."""
         return self.indicator_cache.copy()
+
+    def check_exit(self, df: pd.DataFrame, position) -> Dict:
+        """
+        Evaluate strategy-level exit signal for an open position.
+        Supports both base templates and combo_<entry>__<exit> strategies.
+        """
+        from trainer.core.walk_forward import parse_combo_template, get_signal_module
+
+        spec = self.spec
+        if df is not None and (
+            not self.indicator_cache
+            or str(self.indicator_cache.get('candle_time')) != str(df.index[-1])
+        ):
+            cache = self._compute_indicators(df)
+        else:
+            cache = self.indicator_cache
+
+        if not cache:
+            return {'should_exit': False, 'reason': None}
+
+        pos_dict = position if isinstance(position, dict) else {
+            'direction': 'BUY' if getattr(position, 'type', 0) == 0 else 'SELL',
+            'entry_price': getattr(position, 'price_open', 0.0),
+            'ticket': getattr(position, 'ticket', -1),
+        }
+
+        parsed = parse_combo_template(spec.template)
+        exit_tmpl = parsed[1] if parsed is not None else spec.template
+        if parsed is None and exit_tmpl == 'ma_crossover':
+            # Legacy ma_crossover uses exit_on_opposite_crossover in Engine._manage_positions
+            return {'should_exit': False, 'reason': None}
+
+        signal_mod = get_signal_module(spec.template)
+        return signal_mod.check_exit(cache, pos_dict, spec.parameters)
